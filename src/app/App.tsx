@@ -5,6 +5,31 @@ import Tesseract from 'tesseract.js/dist/tesseract.esm.min.js';
 
 type AppState = 'idle' | 'ready' | 'extracting' | 'done';
 
+type AzureReadLine = {
+  text?: string;
+};
+
+type AzureReadResult = {
+  lines?: AzureReadLine[];
+};
+
+type AzureReadAnalyzeResult = {
+  readResults?: AzureReadResult[];
+};
+
+type AzureReadStatusResponse = {
+  status?: string;
+  analyzeResult?: AzureReadAnalyzeResult;
+};
+
+const AZURE_VISION_ENDPOINT = import.meta.env.VITE_AZURE_VISION_ENDPOINT?.trim();
+const AZURE_VISION_KEY = import.meta.env.VITE_AZURE_VISION_KEY?.trim();
+const AZURE_VISION_LANGUAGE = import.meta.env.VITE_AZURE_VISION_LANGUAGE?.trim() || 'en';
+
+const normalizeEndpoint = (endpoint: string) => endpoint.replace(/\/+$/, '');
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 export default function App() {
   const [status, setStatus] = useState<AppState>('idle');
   const [imageSrc, setImageSrc] = useState<string | null>(null);
@@ -130,32 +155,127 @@ export default function App() {
     }
   };
 
-  // Extract text using Tesseract.js
+  const runTesseractOCR = async (sourceImage: string) => {
+    const result = await Tesseract.recognize(
+      sourceImage,
+      'eng',
+      {
+        logger: m => {
+          if (m.status === 'recognizing text') {
+            setOcrStatusMsg('Reading text locally...');
+            setOcrProgress(Math.round(m.progress * 100));
+          } else {
+            setOcrStatusMsg(m.status.charAt(0).toUpperCase() + m.status.slice(1));
+            setOcrProgress(Math.round(m.progress * 100));
+          }
+        }
+      }
+    );
+
+    return result.data.text || 'No text was found in the image.';
+  };
+
+  const runAzureVisionOCR = async (sourceImage: string) => {
+    if (!AZURE_VISION_ENDPOINT || !AZURE_VISION_KEY) {
+      throw new Error('Azure AI Vision is not configured.');
+    }
+
+    setOcrStatusMsg('Uploading image to Azure AI Vision...');
+    setOcrProgress(10);
+
+    const imageBlob = await fetch(sourceImage).then(res => res.blob());
+    const endpoint = normalizeEndpoint(AZURE_VISION_ENDPOINT);
+    const analyzeUrl = `${endpoint}/vision/v3.2/read/analyze?language=${encodeURIComponent(AZURE_VISION_LANGUAGE)}`;
+
+    const analyzeResponse = await fetch(analyzeUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': imageBlob.type || 'application/octet-stream',
+        'Ocp-Apim-Subscription-Key': AZURE_VISION_KEY,
+      },
+      body: imageBlob,
+    });
+
+    if (!analyzeResponse.ok) {
+      const errorText = await analyzeResponse.text();
+      throw new Error(`Azure analyze request failed: ${analyzeResponse.status} ${errorText}`);
+    }
+
+    const operationLocation = analyzeResponse.headers.get('operation-location');
+    if (!operationLocation) {
+      throw new Error('Azure response did not include operation-location.');
+    }
+
+    setOcrStatusMsg('Azure is reading text...');
+    setOcrProgress(30);
+
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleep(1200);
+
+      const resultResponse = await fetch(operationLocation, {
+        method: 'GET',
+        headers: {
+          'Ocp-Apim-Subscription-Key': AZURE_VISION_KEY,
+        },
+      });
+
+      if (!resultResponse.ok) {
+        const errorText = await resultResponse.text();
+        throw new Error(`Azure status request failed: ${resultResponse.status} ${errorText}`);
+      }
+
+      const payload = (await resultResponse.json()) as AzureReadStatusResponse;
+      const statusValue = payload.status?.toLowerCase();
+
+      if (statusValue === 'succeeded') {
+        setOcrProgress(100);
+        const lines = payload.analyzeResult?.readResults?.flatMap(page => page.lines || []) || [];
+        const combinedText = lines.map(line => line.text || '').filter(Boolean).join('\n');
+        return combinedText || 'No text was found in the image.';
+      }
+
+      if (statusValue === 'failed') {
+        throw new Error('Azure OCR failed while processing the image.');
+      }
+
+      setOcrProgress(Math.min(95, 35 + attempt * 3));
+    }
+
+    throw new Error('Azure OCR timed out while waiting for the result.');
+  };
+
+  // Extract text using Azure AI Vision first, then fallback to on-device OCR when needed
   const handleExtract = async () => {
     if (!imageSrc) return;
+    const sourceImage = imageSrc;
     
     setStatus('extracting');
     setOcrStatusMsg('Preparing image...');
     setOcrProgress(0);
     
     try {
-      const result = await Tesseract.recognize(
-        imageSrc,
-        'eng',
-        { 
-          logger: m => {
-            if (m.status === 'recognizing text') {
-              setOcrStatusMsg('Reading text...');
-              setOcrProgress(Math.round(m.progress * 100));
-            } else {
-              setOcrStatusMsg(m.status.charAt(0).toUpperCase() + m.status.slice(1));
-              setOcrProgress(Math.round(m.progress * 100));
-            }
-          }
+      const azureConfigured = Boolean(AZURE_VISION_ENDPOINT && AZURE_VISION_KEY);
+      const shouldUseAzure = navigator.onLine && azureConfigured;
+
+      if (shouldUseAzure) {
+        try {
+          const azureText = await runAzureVisionOCR(sourceImage);
+          setExtractedText(azureText);
+          setStatus('done');
+          return;
+        } catch (azureError) {
+          console.error('Azure OCR Error:', azureError);
+          setOcrStatusMsg('Azure unavailable, switching to on-device OCR...');
+          setOcrProgress(0);
         }
-      );
-      
-      setExtractedText(result.data.text || "No text was found in the image.");
+      } else if (!navigator.onLine) {
+        setOcrStatusMsg('Offline mode: running on-device OCR...');
+      } else {
+        setOcrStatusMsg('Azure not configured, running on-device OCR...');
+      }
+
+      const localText = await runTesseractOCR(sourceImage);
+      setExtractedText(localText);
       setStatus('done');
     } catch (error) {
       console.error("OCR Error:", error);
