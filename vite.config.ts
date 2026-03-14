@@ -2,7 +2,10 @@ import { defineConfig } from 'vite'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 
-const basePath = process.env.VITE_BASE_PATH || '/photo_note/'
+const repoName = process.env.GITHUB_REPOSITORY?.split('/')[1]
+const basePath =
+  process.env.VITE_BASE_PATH ||
+  (process.env.NODE_ENV === 'production' && repoName ? `/${repoName}/` : '/')
 
 export default defineConfig({
   base: basePath,
