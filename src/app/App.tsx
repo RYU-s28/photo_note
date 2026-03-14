@@ -438,7 +438,9 @@ export default function App() {
     setOcrProgress(0);
     
     try {
-      const azureConfigured = Boolean(AZURE_VISION_ENDPOINT && AZURE_VISION_KEY);
+      const hasAzureEndpoint = Boolean(AZURE_VISION_ENDPOINT);
+      const hasAzureKey = Boolean(AZURE_VISION_KEY);
+      const azureConfigured = hasAzureEndpoint && hasAzureKey;
       const shouldUseAzure = navigator.onLine && azureConfigured;
 
       if (shouldUseAzure) {
@@ -465,7 +467,13 @@ export default function App() {
         setOcrFallbackReason('Device is offline.');
         setOcrStatusMsg('Offline mode: running on-device OCR...');
       } else {
-        setOcrFallbackReason('Azure endpoint or key is missing.');
+        if (!hasAzureEndpoint && !hasAzureKey) {
+          setOcrFallbackReason('Azure endpoint and key are not loaded. Restart the dev server after editing .env.');
+        } else if (!hasAzureEndpoint) {
+          setOcrFallbackReason('Azure endpoint is missing. Check VITE_AZURE_CV_ENDPOINT.');
+        } else {
+          setOcrFallbackReason('Azure key is missing. Check VITE_AZURE_CV_KEY.');
+        }
         setOcrStatusMsg('Azure not configured, running on-device OCR...');
       }
 
