@@ -5,6 +5,8 @@ import Tesseract from 'tesseract.js';
 
 type AppState = 'idle' | 'ready' | 'extracting' | 'done';
 
+type OcrEngine = 'azure' | 'tesseract';
+
 type AzureReadLine = {
   text?: string;
 };
@@ -28,12 +30,25 @@ const AZURE_VISION_LANGUAGE = import.meta.env.VITE_AZURE_VISION_LANGUAGE?.trim()
 
 const normalizeEndpoint = (endpoint: string) => endpoint.replace(/\/+$/, '');
 
+const MIN_CAMERA_ZOOM = 1;
+const MAX_CAMERA_ZOOM = 3;
+
+const clampZoom = (zoomValue: number) => Math.min(MAX_CAMERA_ZOOM, Math.max(MIN_CAMERA_ZOOM, zoomValue));
+
+const getTouchDistance = (touches: React.TouchList) => {
+  const [firstTouch, secondTouch] = [touches[0], touches[1]];
+  const deltaX = firstTouch.clientX - secondTouch.clientX;
+  const deltaY = firstTouch.clientY - secondTouch.clientY;
+  return Math.hypot(deltaX, deltaY);
+};
+
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export default function App() {
   const [status, setStatus] = useState<AppState>('idle');
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [extractedText, setExtractedText] = useState<string>('');
+  const [ocrEngine, setOcrEngine] = useState<OcrEngine | null>(null);
   const [copied, setCopied] = useState(false);
   
   // OCR State
@@ -45,15 +60,19 @@ export default function App() {
   const [isCameraPreviewReady, setCameraPreviewReady] = useState(false);
   const [cameraError, setCameraError] = useState('');
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
+  const [cameraZoom, setCameraZoom] = useState<number>(1);
   const [isDragging, setIsDragging] = useState(false);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const pinchStartDistanceRef = useRef<number | null>(null);
+  const pinchStartZoomRef = useRef<number>(1);
 
   const startCamera = async (mode: 'environment' | 'user') => {
     stopCamera();
+    setCameraZoom(1);
     setCameraPreviewReady(false);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -104,6 +123,33 @@ export default function App() {
     setCameraError('');
   };
 
+  const handleCameraTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (e.touches.length !== 2) {
+      return;
+    }
+
+    pinchStartDistanceRef.current = getTouchDistance(e.touches);
+    pinchStartZoomRef.current = cameraZoom;
+  };
+
+  const handleCameraTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (e.touches.length !== 2 || pinchStartDistanceRef.current === null) {
+      return;
+    }
+
+    e.preventDefault();
+    const currentDistance = getTouchDistance(e.touches);
+    const zoomMultiplier = currentDistance / pinchStartDistanceRef.current;
+    const nextZoom = clampZoom(pinchStartZoomRef.current * zoomMultiplier);
+    setCameraZoom(nextZoom);
+  };
+
+  const handleCameraTouchEnd = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (e.touches.length < 2) {
+      pinchStartDistanceRef.current = null;
+    }
+  };
+
   const capturePhoto = () => {
     if (videoRef.current && canvasRef.current) {
       const video = videoRef.current;
@@ -112,12 +158,33 @@ export default function App() {
       canvas.height = video.videoHeight;
       const ctx = canvas.getContext('2d');
       if (ctx) {
-        // If user mode, flip the image horizontally
+        const sourceWidth = video.videoWidth / cameraZoom;
+        const sourceHeight = video.videoHeight / cameraZoom;
+        const sourceX = (video.videoWidth - sourceWidth) / 2;
+        const sourceY = (video.videoHeight - sourceHeight) / 2;
+
+        ctx.save();
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // If user mode, flip the image horizontally.
         if (facingMode === 'user') {
           ctx.translate(canvas.width, 0);
           ctx.scale(-1, 1);
         }
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        ctx.drawImage(
+          video,
+          sourceX,
+          sourceY,
+          sourceWidth,
+          sourceHeight,
+          0,
+          0,
+          canvas.width,
+          canvas.height
+        );
+        ctx.restore();
+
         const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
         setImageSrc(dataUrl);
         setStatus('ready');
@@ -277,6 +344,7 @@ export default function App() {
     const sourceImage = imageSrc;
     
     setStatus('extracting');
+    setOcrEngine(null);
     setOcrStatusMsg('Preparing image...');
     setOcrProgress(0);
     
@@ -288,6 +356,7 @@ export default function App() {
         try {
           const azureText = await runAzureVisionOCR(sourceImage);
           setExtractedText(azureText);
+          setOcrEngine('azure');
           setStatus('done');
           return;
         } catch (azureError: unknown) {
@@ -308,10 +377,12 @@ export default function App() {
 
       const localText = await runTesseractOCR(sourceImage);
       setExtractedText(localText);
+      setOcrEngine('tesseract');
       setStatus('done');
     } catch (error) {
       console.error("OCR Error:", error);
       setExtractedText("Error extracting text. Please try again.");
+      setOcrEngine(null);
       setStatus('done');
     }
   };
@@ -326,11 +397,20 @@ export default function App() {
     setStatus('idle');
     setImageSrc(null);
     setExtractedText('');
+    setOcrEngine(null);
     setOcrProgress(0);
+    setCameraZoom(1);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
   };
+
+  const ocrSourceLabel =
+    ocrEngine === 'azure'
+      ? 'Source: Azure AI Vision'
+      : ocrEngine === 'tesseract'
+      ? 'Source: Tesseract (on-device)'
+      : 'Source: unavailable';
 
   return (
     <div className="min-h-screen bg-[#0b0b0f] text-[#f5f5f7] flex items-center justify-center p-4 sm:p-8 font-sans antialiased selection:bg-[#4da3ff]/30">
@@ -415,15 +495,31 @@ export default function App() {
                   </div>
                 ) : (
                   // Camera View UI
-                  <div className="relative rounded-2xl overflow-hidden bg-black h-[360px] group">
+                  <div
+                    className="relative rounded-2xl overflow-hidden bg-black h-[360px] group"
+                    onTouchStart={handleCameraTouchStart}
+                    onTouchMove={handleCameraTouchMove}
+                    onTouchEnd={handleCameraTouchEnd}
+                    onTouchCancel={handleCameraTouchEnd}
+                    style={{ touchAction: 'none' }}
+                  >
                     <video
                       ref={videoRef}
                       autoPlay
                       playsInline
                       muted
                       onLoadedData={handleVideoReady}
-                      className={`absolute inset-0 w-full h-full object-cover transition-transform duration-500 ${facingMode === 'user' ? 'scale-x-[-1]' : ''}`}
+                      className="absolute inset-0 w-full h-full object-cover transition-transform duration-150"
+                      style={{ transform: `${facingMode === 'user' ? 'scaleX(-1) ' : ''}scale(${cameraZoom})` }}
                     />
+
+                    <div className="absolute top-3 left-3 z-10 px-2.5 py-1 rounded-full bg-black/45 text-white text-xs font-medium backdrop-blur-sm border border-white/20">
+                      {cameraZoom.toFixed(1)}x
+                    </div>
+
+                    <div className="absolute top-3 right-3 z-10 px-2.5 py-1 rounded-full bg-black/35 text-white/85 text-[11px] font-medium backdrop-blur-sm border border-white/15">
+                      Pinch to zoom
+                    </div>
 
                     {!isCameraPreviewReady && (
                       <div className="absolute inset-0 flex items-center justify-center bg-black/70 backdrop-blur-[1px]">
@@ -552,7 +648,7 @@ export default function App() {
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="text-[#f5f5f7] text-sm font-medium truncate">Extracted Note</p>
-                    <p className="text-[#9aa0aa] text-xs truncate">Ready to edit</p>
+                    <p className="text-[#9aa0aa] text-xs truncate">{ocrSourceLabel}</p>
                   </div>
                   <button 
                     onClick={handleReset}
