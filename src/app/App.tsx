@@ -42,6 +42,7 @@ export default function App() {
   
   // Camera & Drag State
   const [isCameraActive, setCameraActive] = useState(false);
+  const [isCameraPreviewReady, setCameraPreviewReady] = useState(false);
   const [cameraError, setCameraError] = useState('');
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
   const [isDragging, setIsDragging] = useState(false);
@@ -53,12 +54,16 @@ export default function App() {
 
   const startCamera = async (mode: 'environment' | 'user') => {
     stopCamera();
+    setCameraPreviewReady(false);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: mode }
       });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        await videoRef.current.play().catch(() => {
+          // Browser autoplay policies can block immediate play; loaded data handler can recover.
+        });
       }
       streamRef.current = stream;
       setCameraActive(true);
@@ -76,6 +81,7 @@ export default function App() {
       streamRef.current = null;
     }
     setCameraActive(false);
+    setCameraPreviewReady(false);
   };
 
   useEffect(() => {
@@ -91,6 +97,11 @@ export default function App() {
     const newMode = facingMode === 'environment' ? 'user' : 'environment';
     setFacingMode(newMode);
     startCamera(newMode);
+  };
+
+  const handleVideoReady = () => {
+    setCameraPreviewReady(true);
+    setCameraError('');
   };
 
   const capturePhoto = () => {
@@ -154,6 +165,19 @@ export default function App() {
       reader.readAsDataURL(file);
     }
   };
+
+  useEffect(() => {
+    if (status !== 'idle' || !isCameraActive || isCameraPreviewReady) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setCameraError('Camera preview not available. Please upload an image instead.');
+      setCameraActive(false);
+    }, 3000);
+
+    return () => window.clearTimeout(timer);
+  }, [status, isCameraActive, isCameraPreviewReady]);
 
   const runTesseractOCR = async (sourceImage: string) => {
     const result = await Tesseract.recognize(
@@ -370,9 +394,9 @@ export default function App() {
                     <div className="bg-[#15161b] p-4 rounded-2xl mb-4 text-[#9aa0aa] shadow-sm border border-white/[0.02]">
                       <CameraOff className="w-6 h-6" />
                     </div>
-                    <span className="text-[#f5f5f7] font-medium mb-1.5 text-sm">Camera access denied</span>
+                    <span className="text-[#f5f5f7] font-medium mb-1.5 text-sm">Camera unavailable</span>
                     <span className="text-[#9aa0aa] text-xs text-center mb-6 max-w-[200px]">
-                      Please allow camera access or upload an image manually.
+                      {cameraError}
                     </span>
                     <button 
                       onClick={() => fileInputRef.current?.click()}
@@ -389,8 +413,18 @@ export default function App() {
                       autoPlay
                       playsInline
                       muted
+                      onLoadedData={handleVideoReady}
                       className={`absolute inset-0 w-full h-full object-cover transition-transform duration-500 ${facingMode === 'user' ? 'scale-x-[-1]' : ''}`}
                     />
+
+                    {!isCameraPreviewReady && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-black/70 backdrop-blur-[1px]">
+                        <div className="text-center px-4">
+                          <Loader2 className="w-6 h-6 text-white animate-spin mx-auto mb-3" />
+                          <p className="text-white text-sm font-medium">Starting camera...</p>
+                        </div>
+                      </div>
+                    )}
                     
                     {/* Viewfinder Overlays */}
                     <div className="absolute inset-0 pointer-events-none p-6 flex flex-col justify-between opacity-40 mix-blend-overlay">
