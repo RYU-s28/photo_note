@@ -7,6 +7,20 @@ type AppState = 'idle' | 'ready' | 'extracting' | 'done';
 
 type OcrEngine = 'azure' | 'tesseract';
 
+type AzureImageAnalysisLine = {
+  text?: string;
+};
+
+type AzureImageAnalysisBlock = {
+  lines?: AzureImageAnalysisLine[];
+};
+
+type AzureImageAnalysisResponse = {
+  readResult?: {
+    blocks?: AzureImageAnalysisBlock[];
+  };
+};
+
 type AzureReadLine = {
   text?: string;
 };
@@ -24,8 +38,14 @@ type AzureReadStatusResponse = {
   analyzeResult?: AzureReadAnalyzeResult;
 };
 
-const AZURE_VISION_ENDPOINT = import.meta.env.VITE_AZURE_CV_ENDPOINT?.trim();
-const AZURE_VISION_KEY = import.meta.env.VITE_AZURE_CV_KEY?.trim();
+const trimEnv = (value?: string) => value?.trim();
+
+const AZURE_VISION_ENDPOINT =
+  trimEnv(import.meta.env.VITE_AZURE_CV_ENDPOINT) ||
+  trimEnv(import.meta.env.VITE_AZURE_VISION_ENDPOINT);
+const AZURE_VISION_KEY =
+  trimEnv(import.meta.env.VITE_AZURE_CV_KEY) ||
+  trimEnv(import.meta.env.VITE_AZURE_VISION_KEY);
 const AZURE_VISION_LANGUAGE = import.meta.env.VITE_AZURE_VISION_LANGUAGE?.trim() || 'en';
 
 const normalizeEndpoint = (endpoint: string) => endpoint.replace(/\/+$/, '');
@@ -42,6 +62,32 @@ const getTouchDistance = (touches: React.TouchList) => {
   return Math.hypot(deltaX, deltaY);
 };
 
+const toAzureFallbackReason = (errorMessage: string) => {
+  const normalizedMessage = errorMessage.toLowerCase();
+
+  if (errorMessage === 'RATE_LIMIT') {
+    return 'Azure rate limit reached.';
+  }
+
+  if (normalizedMessage.includes('failed to fetch')) {
+    return 'Azure request blocked by network or CORS.';
+  }
+
+  if (normalizedMessage.includes('401') || normalizedMessage.includes('403')) {
+    return 'Azure key or endpoint is invalid.';
+  }
+
+  if (normalizedMessage.includes('404')) {
+    return 'Azure endpoint path is not available for this resource.';
+  }
+
+  if (normalizedMessage.includes('timeout')) {
+    return 'Azure OCR timed out.';
+  }
+
+  return 'Azure OCR request failed.';
+};
+
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export default function App() {
@@ -49,6 +95,7 @@ export default function App() {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [extractedText, setExtractedText] = useState<string>('');
   const [ocrEngine, setOcrEngine] = useState<OcrEngine | null>(null);
+  const [ocrFallbackReason, setOcrFallbackReason] = useState('');
   const [copied, setCopied] = useState(false);
   
   // OCR State
@@ -276,14 +323,52 @@ export default function App() {
 
     const imageBlob = await fetch(sourceImage).then(res => res.blob());
     const endpoint = normalizeEndpoint(AZURE_VISION_ENDPOINT);
-    const analyzeUrl = `${endpoint}/vision/v3.2/read/analyze?language=${encodeURIComponent(AZURE_VISION_LANGUAGE)}`;
+    const headers = {
+      'Content-Type': imageBlob.type || 'application/octet-stream',
+      'Ocp-Apim-Subscription-Key': AZURE_VISION_KEY,
+    };
 
+    const imageAnalysisUrl = `${endpoint}/computervision/imageanalysis:analyze?api-version=2024-02-01&features=read&language=${encodeURIComponent(AZURE_VISION_LANGUAGE)}`;
+
+    try {
+      const imageAnalysisResponse = await fetch(imageAnalysisUrl, {
+        method: 'POST',
+        headers,
+        body: imageBlob,
+      });
+
+      if (!imageAnalysisResponse.ok) {
+        const errorText = await imageAnalysisResponse.text();
+        if (imageAnalysisResponse.status === 429) {
+          throw new Error('RATE_LIMIT');
+        }
+
+        throw new Error(`Azure image analysis request failed: ${imageAnalysisResponse.status} ${errorText}`);
+      }
+
+      setOcrStatusMsg('Azure is reading text...');
+      setOcrProgress(85);
+
+      const payload = (await imageAnalysisResponse.json()) as AzureImageAnalysisResponse;
+      const lines = payload.readResult?.blocks?.flatMap(block => block.lines || []) || [];
+      const combinedText = lines.map(line => line.text || '').filter(Boolean).join('\n');
+      setOcrProgress(100);
+      return combinedText || 'No text was found in the image.';
+    } catch (imageAnalysisError: unknown) {
+      const imageAnalysisMessage = imageAnalysisError instanceof Error ? imageAnalysisError.message : '';
+      if (imageAnalysisMessage === 'RATE_LIMIT') {
+        throw imageAnalysisError;
+      }
+      console.warn('Azure image analysis endpoint failed, trying legacy endpoint.', imageAnalysisMessage);
+    }
+
+    setOcrStatusMsg('Trying legacy Azure OCR endpoint...');
+    setOcrProgress(25);
+
+    const analyzeUrl = `${endpoint}/vision/v3.2/read/analyze?language=${encodeURIComponent(AZURE_VISION_LANGUAGE)}`;
     const analyzeResponse = await fetch(analyzeUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': imageBlob.type || 'application/octet-stream',
-        'Ocp-Apim-Subscription-Key': AZURE_VISION_KEY,
-      },
+      headers,
       body: imageBlob,
     });
 
@@ -301,10 +386,10 @@ export default function App() {
     }
 
     setOcrStatusMsg('Azure is reading text...');
-    setOcrProgress(30);
+    setOcrProgress(35);
 
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      await sleep(1200);
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await sleep(1500);
 
       const resultResponse = await fetch(operationLocation, {
         method: 'GET',
@@ -315,6 +400,9 @@ export default function App() {
 
       if (!resultResponse.ok) {
         const errorText = await resultResponse.text();
+        if (resultResponse.status === 429) {
+          throw new Error('RATE_LIMIT');
+        }
         throw new Error(`Azure status request failed: ${resultResponse.status} ${errorText}`);
       }
 
@@ -332,7 +420,7 @@ export default function App() {
         throw new Error('Azure OCR failed while processing the image.');
       }
 
-      setOcrProgress(Math.min(95, 35 + attempt * 3));
+      setOcrProgress(Math.min(95, 45 + attempt * 4));
     }
 
     throw new Error('Azure OCR timed out while waiting for the result.');
@@ -345,6 +433,7 @@ export default function App() {
     
     setStatus('extracting');
     setOcrEngine(null);
+    setOcrFallbackReason('');
     setOcrStatusMsg('Preparing image...');
     setOcrProgress(0);
     
@@ -357,10 +446,13 @@ export default function App() {
           const azureText = await runAzureVisionOCR(sourceImage);
           setExtractedText(azureText);
           setOcrEngine('azure');
+          setOcrFallbackReason('');
           setStatus('done');
           return;
         } catch (azureError: unknown) {
           const msg = azureError instanceof Error ? azureError.message : '';
+          const fallbackReason = toAzureFallbackReason(msg);
+          setOcrFallbackReason(fallbackReason);
           if (msg === 'RATE_LIMIT') {
             setOcrStatusMsg('Rate limit reached, switching to on-device OCR...');
           } else {
@@ -370,8 +462,10 @@ export default function App() {
           setOcrProgress(0);
         }
       } else if (!navigator.onLine) {
+        setOcrFallbackReason('Device is offline.');
         setOcrStatusMsg('Offline mode: running on-device OCR...');
       } else {
+        setOcrFallbackReason('Azure endpoint or key is missing.');
         setOcrStatusMsg('Azure not configured, running on-device OCR...');
       }
 
@@ -383,6 +477,7 @@ export default function App() {
       console.error("OCR Error:", error);
       setExtractedText("Error extracting text. Please try again.");
       setOcrEngine(null);
+      setOcrFallbackReason('OCR failed.');
       setStatus('done');
     }
   };
@@ -398,6 +493,7 @@ export default function App() {
     setImageSrc(null);
     setExtractedText('');
     setOcrEngine(null);
+    setOcrFallbackReason('');
     setOcrProgress(0);
     setCameraZoom(1);
     if (fileInputRef.current) {
@@ -411,6 +507,10 @@ export default function App() {
       : ocrEngine === 'tesseract'
       ? 'Source: Tesseract (on-device)'
       : 'Source: unavailable';
+
+  const ocrSourceDetail = ocrEngine === 'tesseract' && ocrFallbackReason
+    ? `Reason: ${ocrFallbackReason}`
+    : null;
 
   return (
     <div className="min-h-screen bg-[#0b0b0f] text-[#f5f5f7] flex items-center justify-center p-4 sm:p-8 font-sans antialiased selection:bg-[#4da3ff]/30">
@@ -649,6 +749,9 @@ export default function App() {
                   <div className="flex-1 min-w-0">
                     <p className="text-[#f5f5f7] text-sm font-medium truncate">Extracted Note</p>
                     <p className="text-[#9aa0aa] text-xs truncate">{ocrSourceLabel}</p>
+                    {ocrSourceDetail ? (
+                      <p className="text-[#7f8692] text-[11px] mt-0.5 truncate">{ocrSourceDetail}</p>
+                    ) : null}
                   </div>
                   <button 
                     onClick={handleReset}

@@ -14,10 +14,12 @@ Photo Note extracts text from images.
 3. Fill in your values:
 
 ```env
-VITE_AZURE_VISION_ENDPOINT=https://your-resource-name.cognitiveservices.azure.com
-VITE_AZURE_VISION_KEY=your-azure-vision-key
+VITE_AZURE_CV_ENDPOINT=https://your-resource-name.cognitiveservices.azure.com
+VITE_AZURE_CV_KEY=your-azure-vision-key
 VITE_AZURE_VISION_LANGUAGE=en
 ```
+
+If you update `.env` while `npm run dev` is already running, restart the dev server so Vite reloads env values.
 
 Then run:
 
