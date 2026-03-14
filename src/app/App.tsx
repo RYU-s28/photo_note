@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Upload, FileText, Check, Copy, Loader2, X, ImagePlus, SwitchCamera, CameraOff } from 'lucide-react';
-import Tesseract from 'tesseract.js/dist/tesseract.esm.min.js';
+import Tesseract from 'tesseract.js';
 
 type AppState = 'idle' | 'ready' | 'extracting' | 'done';
 
@@ -22,8 +22,8 @@ type AzureReadStatusResponse = {
   analyzeResult?: AzureReadAnalyzeResult;
 };
 
-const AZURE_VISION_ENDPOINT = import.meta.env.VITE_AZURE_VISION_ENDPOINT?.trim();
-const AZURE_VISION_KEY = import.meta.env.VITE_AZURE_VISION_KEY?.trim();
+const AZURE_VISION_ENDPOINT = import.meta.env.VITE_AZURE_CV_ENDPOINT?.trim();
+const AZURE_VISION_KEY = import.meta.env.VITE_AZURE_CV_KEY?.trim();
 const AZURE_VISION_LANGUAGE = import.meta.env.VITE_AZURE_VISION_LANGUAGE?.trim() || 'en';
 
 const normalizeEndpoint = (endpoint: string) => endpoint.replace(/\/+$/, '');
@@ -184,7 +184,7 @@ export default function App() {
       sourceImage,
       'eng',
       {
-        logger: m => {
+        logger: (m: { status: string; progress: number }) => {
           if (m.status === 'recognizing text') {
             setOcrStatusMsg('Reading text locally...');
             setOcrProgress(Math.round(m.progress * 100));
@@ -222,6 +222,9 @@ export default function App() {
 
     if (!analyzeResponse.ok) {
       const errorText = await analyzeResponse.text();
+      if (analyzeResponse.status === 429) {
+        throw new Error('RATE_LIMIT');
+      }
       throw new Error(`Azure analyze request failed: ${analyzeResponse.status} ${errorText}`);
     }
 
@@ -287,9 +290,14 @@ export default function App() {
           setExtractedText(azureText);
           setStatus('done');
           return;
-        } catch (azureError) {
-          console.error('Azure OCR Error:', azureError);
-          setOcrStatusMsg('Azure unavailable, switching to on-device OCR...');
+        } catch (azureError: unknown) {
+          const msg = azureError instanceof Error ? azureError.message : '';
+          if (msg === 'RATE_LIMIT') {
+            setOcrStatusMsg('Rate limit reached, switching to on-device OCR...');
+          } else {
+            setOcrStatusMsg('Azure unavailable, switching to on-device OCR...');
+          }
+          console.warn('Azure OCR fallback:', msg);
           setOcrProgress(0);
         }
       } else if (!navigator.onLine) {
