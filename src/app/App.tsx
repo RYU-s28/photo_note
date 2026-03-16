@@ -23,8 +23,10 @@ type AzureBackendStatus = 'checking' | 'configured' | 'not-configured' | 'unreac
 
 const MIN_CAMERA_ZOOM = 1;
 const MAX_CAMERA_ZOOM = 3;
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
 
 const clampZoom = (zoomValue: number) => Math.min(MAX_CAMERA_ZOOM, Math.max(MIN_CAMERA_ZOOM, zoomValue));
+const getApiUrl = (path: string) => `${API_BASE_URL}${path}`;
 
 const getTouchDistance = (touches: React.TouchList) => {
   const [firstTouch, secondTouch] = [touches[0], touches[1]];
@@ -296,7 +298,7 @@ export default function App() {
 
     const refreshBackendHealth = async () => {
       try {
-        const response = await fetch('/api/ocr/health');
+        const response = await fetch(getApiUrl('/api/ocr/health'));
 
         if (!response.ok) {
           throw new Error(`HTTP_${response.status}`);
@@ -347,7 +349,7 @@ export default function App() {
     setOcrProgress(10);
 
     const imageBlob = await fetch(sourceImage).then(res => res.blob());
-    const response = await fetch('/api/ocr/azure', {
+    const response = await fetch(getApiUrl('/api/ocr/azure'), {
       method: 'POST',
       headers: {
         'Content-Type': imageBlob.type || 'application/octet-stream',
@@ -483,12 +485,18 @@ export default function App() {
 
   const azureBackendStatusDetail =
     azureBackendStatus === 'configured'
-      ? 'Using server-side VISION_ENDPOINT and VISION_KEY.'
+      ? API_BASE_URL
+        ? `Using secure OCR backend at ${API_BASE_URL}.`
+        : 'Using server-side VISION_ENDPOINT and VISION_KEY.'
       : azureBackendStatus === 'not-configured'
-      ? 'Set VISION_ENDPOINT and VISION_KEY in .env and restart API server.'
+      ? API_BASE_URL
+        ? 'Set VISION_ENDPOINT and VISION_KEY on the deployed API server and restart it.'
+        : 'Set VISION_ENDPOINT and VISION_KEY in .env and restart API server.'
       : azureBackendStatus === 'unreachable'
-      ? 'Start the local API server to enable Azure OCR.'
-      : 'Checking /api/ocr/health...';
+      ? API_BASE_URL
+        ? `Configured backend ${API_BASE_URL} is unreachable.`
+        : 'Start the local API server to enable Azure OCR.'
+      : `Checking ${getApiUrl('/api/ocr/health')}...`;
 
   const azureStatusDotClass =
     azureBackendStatus === 'configured'

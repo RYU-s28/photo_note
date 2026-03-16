@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: photo-note-api
+    runtime: node
+    buildCommand: npm ci
+    startCommand: node server/index.mjs
+    envVars:
+      - key: VISION_ENDPOINT
+        sync: false
+      - key: VISION_KEY
+        sync: false
+      - key: VISION_LANGUAGE
+        value: en
+      - key: CORS_ALLOW_ORIGINS
+        sync: false

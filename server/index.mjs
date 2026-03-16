@@ -15,10 +15,18 @@ const DEFAULT_POLL_INTERVAL_MS = 1500;
 const DEFAULT_MAX_POLL_ATTEMPTS = 12;
 
 const normalizeEndpoint = endpoint => endpoint.replace(/\/+$/, '');
+const normalizeOrigin = origin => origin.trim().replace(/\/+$/, '').toLowerCase();
 
 const parseEnvNumber = (rawValue, fallback) => {
   const parsedValue = Number(rawValue);
   return Number.isFinite(parsedValue) && parsedValue > 0 ? parsedValue : fallback;
+};
+
+const parseEnvList = rawValue => {
+  return String(rawValue || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
 };
 
 const firstNonEmptyEnv = (...keys) => {
@@ -89,6 +97,9 @@ const getConfig = () => {
     timeoutMs: parseEnvNumber(process.env.AZURE_REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
     pollIntervalMs: parseEnvNumber(process.env.AZURE_POLL_INTERVAL_MS, DEFAULT_POLL_INTERVAL_MS),
     maxPollAttempts: parseEnvNumber(process.env.AZURE_MAX_POLL_ATTEMPTS, DEFAULT_MAX_POLL_ATTEMPTS),
+    allowedOrigins: parseEnvList(
+      firstNonEmptyEnv('CORS_ALLOW_ORIGINS', 'CORS_ALLOW_ORIGIN')
+    ),
   };
 };
 
@@ -334,6 +345,50 @@ const mapAzureError = (status, payload) => {
 
 const app = express();
 const startupConfig = getConfig();
+
+app.use((req, res, next) => {
+  const { allowedOrigins } = getConfig();
+
+  if (allowedOrigins.length === 0) {
+    next();
+    return;
+  }
+
+  const requestOrigin = String(req.headers.origin || '').trim();
+  const allowAnyOrigin = allowedOrigins.includes('*');
+  const originAllowed =
+    requestOrigin.length > 0 &&
+    (allowAnyOrigin ||
+      allowedOrigins.some(origin => normalizeOrigin(origin) === normalizeOrigin(requestOrigin)));
+
+  if (originAllowed) {
+    if (allowAnyOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    } else {
+      res.setHeader('Access-Control-Allow-Origin', requestOrigin);
+      res.append('Vary', 'Origin');
+    }
+
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Max-Age', '86400');
+  }
+
+  if (req.method === 'OPTIONS') {
+    if (!requestOrigin || originAllowed) {
+      res.status(204).end();
+      return;
+    }
+
+    res.status(403).json({
+      error: 'Origin not allowed.',
+      code: 'ORIGIN_NOT_ALLOWED',
+    });
+    return;
+  }
+
+  next();
+});
 
 app.get('/api/ocr/health', (_req, res) => {
   const config = getConfig();

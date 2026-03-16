@@ -28,6 +28,7 @@ VISION_LANGUAGE=en
 # Optional
 API_PORT=8787
 MAX_IMAGE_BYTES=10485760
+CORS_ALLOW_ORIGINS=https://your-user.github.io
 ```
 
 If you update `.env` while `npm run dev` is already running, restart the dev command so the API server reloads values.
@@ -53,3 +54,15 @@ npm run dev
 - Backend API: Express on port 8787
 
 If Azure settings are missing, backend is unavailable, or the device is offline, the app automatically uses local OCR with Tesseract.
+
+## GitHub Pages deployment
+
+GitHub Pages can host the frontend, but it cannot run the Node/Express API from `server/index.mjs`. To use Azure OCR on GitHub Pages:
+
+1. Deploy the API server to a backend host such as Azure App Service, Render, Railway, Fly.io, or another Node runtime.
+2. Set backend env vars there: `VISION_ENDPOINT`, `VISION_KEY`, and optionally `VISION_LANGUAGE`.
+3. Set `CORS_ALLOW_ORIGINS` on the backend to your Pages origin. For a site served from `https://your-user.github.io/photo_note/`, the correct origin is `https://your-user.github.io`.
+4. In your GitHub repository settings, add an Actions variable named `VITE_API_BASE_URL` with your deployed API base URL, for example `https://photo-note-api.onrender.com`.
+5. Push to `main` or rerun the Pages workflow. The frontend build will use that backend URL instead of local `/api` routes.
+
+Without a separate backend host, GitHub Pages can only use the local Tesseract fallback because Azure keys must remain server-side.
