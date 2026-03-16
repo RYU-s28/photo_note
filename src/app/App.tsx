@@ -7,48 +7,19 @@ type AppState = 'idle' | 'ready' | 'extracting' | 'done';
 
 type OcrEngine = 'azure' | 'tesseract';
 
-type AzureImageAnalysisLine = {
+type AzureBackendOcrResponse = {
   text?: string;
+  source?: string;
+  modelVersion?: string | null;
+  error?: string;
+  code?: string;
 };
 
-type AzureImageAnalysisBlock = {
-  lines?: AzureImageAnalysisLine[];
+type AzureBackendHealthResponse = {
+  azureConfigured?: boolean;
 };
 
-type AzureImageAnalysisResponse = {
-  readResult?: {
-    blocks?: AzureImageAnalysisBlock[];
-  };
-};
-
-type AzureReadLine = {
-  text?: string;
-};
-
-type AzureReadResult = {
-  lines?: AzureReadLine[];
-};
-
-type AzureReadAnalyzeResult = {
-  readResults?: AzureReadResult[];
-};
-
-type AzureReadStatusResponse = {
-  status?: string;
-  analyzeResult?: AzureReadAnalyzeResult;
-};
-
-const trimEnv = (value?: string) => value?.trim();
-
-const AZURE_VISION_ENDPOINT =
-  trimEnv(import.meta.env.VITE_AZURE_CV_ENDPOINT) ||
-  trimEnv(import.meta.env.VITE_AZURE_VISION_ENDPOINT);
-const AZURE_VISION_KEY =
-  trimEnv(import.meta.env.VITE_AZURE_CV_KEY) ||
-  trimEnv(import.meta.env.VITE_AZURE_VISION_KEY);
-const AZURE_VISION_LANGUAGE = import.meta.env.VITE_AZURE_VISION_LANGUAGE?.trim() || 'en';
-
-const normalizeEndpoint = (endpoint: string) => endpoint.replace(/\/+$/, '');
+type AzureBackendStatus = 'checking' | 'configured' | 'not-configured' | 'unreachable';
 
 const MIN_CAMERA_ZOOM = 1;
 const MAX_CAMERA_ZOOM = 3;
@@ -63,22 +34,50 @@ const getTouchDistance = (touches: React.TouchList) => {
 };
 
 const toAzureFallbackReason = (errorMessage: string) => {
+  if (!errorMessage) {
+    return 'Azure OCR request failed.';
+  }
+
   const normalizedMessage = errorMessage.toLowerCase();
 
   if (errorMessage === 'RATE_LIMIT') {
     return 'Azure rate limit reached.';
   }
 
-  if (normalizedMessage.includes('failed to fetch')) {
-    return 'Azure request blocked by network or CORS.';
+  if (errorMessage === 'AZURE_NOT_CONFIGURED') {
+    return 'Backend is missing VISION_ENDPOINT or VISION_KEY.';
   }
 
-  if (normalizedMessage.includes('401') || normalizedMessage.includes('403')) {
-    return 'Azure key or endpoint is invalid.';
+  if (errorMessage === 'AZURE_AUTH_FAILED') {
+    return 'Backend Azure key is invalid.';
   }
 
-  if (normalizedMessage.includes('404')) {
+  if (errorMessage === 'AZURE_ENDPOINT_UNAVAILABLE') {
     return 'Azure endpoint path is not available for this resource.';
+  }
+
+  if (errorMessage === 'AZURE_BAD_REQUEST') {
+    return 'Azure rejected this image request.';
+  }
+
+  if (errorMessage === 'AZURE_REQUEST_FAILED') {
+    return 'Azure OCR request failed on the backend.';
+  }
+
+  if (errorMessage === 'REQUEST_TIMEOUT') {
+    return 'Azure OCR timed out.';
+  }
+
+  if (errorMessage === 'IMAGE_TOO_LARGE') {
+    return 'Image is too large for backend upload limits.';
+  }
+
+  if (errorMessage === 'UNSUPPORTED_MEDIA_TYPE' || errorMessage === 'INVALID_IMAGE_BODY') {
+    return 'Unsupported image format.';
+  }
+
+  if (normalizedMessage.includes('failed to fetch')) {
+    return 'OCR backend is unreachable.';
   }
 
   if (normalizedMessage.includes('timeout')) {
@@ -88,8 +87,6 @@ const toAzureFallbackReason = (errorMessage: string) => {
   return 'Azure OCR request failed.';
 };
 
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
 export default function App() {
   const [status, setStatus] = useState<AppState>('idle');
   const [imageSrc, setImageSrc] = useState<string | null>(null);
@@ -97,6 +94,7 @@ export default function App() {
   const [ocrEngine, setOcrEngine] = useState<OcrEngine | null>(null);
   const [ocrFallbackReason, setOcrFallbackReason] = useState('');
   const [copied, setCopied] = useState(false);
+  const [azureBackendStatus, setAzureBackendStatus] = useState<AzureBackendStatus>('checking');
   
   // OCR State
   const [ocrStatusMsg, setOcrStatusMsg] = useState<string>('Initializing OCR...');
@@ -293,6 +291,37 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [status, isCameraActive, isCameraPreviewReady]);
 
+  useEffect(() => {
+    let isCancelled = false;
+
+    const refreshBackendHealth = async () => {
+      try {
+        const response = await fetch('/api/ocr/health');
+
+        if (!response.ok) {
+          throw new Error(`HTTP_${response.status}`);
+        }
+
+        const payload = (await response.json()) as AzureBackendHealthResponse;
+        if (!isCancelled) {
+          setAzureBackendStatus(payload.azureConfigured ? 'configured' : 'not-configured');
+        }
+      } catch {
+        if (!isCancelled) {
+          setAzureBackendStatus('unreachable');
+        }
+      }
+    };
+
+    refreshBackendHealth();
+    window.addEventListener('online', refreshBackendHealth);
+
+    return () => {
+      isCancelled = true;
+      window.removeEventListener('online', refreshBackendHealth);
+    };
+  }, []);
+
   const runTesseractOCR = async (sourceImage: string) => {
     const result = await Tesseract.recognize(
       sourceImage,
@@ -314,116 +343,42 @@ export default function App() {
   };
 
   const runAzureVisionOCR = async (sourceImage: string) => {
-    if (!AZURE_VISION_ENDPOINT || !AZURE_VISION_KEY) {
-      throw new Error('Azure AI Vision is not configured.');
-    }
-
-    setOcrStatusMsg('Uploading image to Azure AI Vision...');
+    setOcrStatusMsg('Uploading image to secure OCR backend...');
     setOcrProgress(10);
 
     const imageBlob = await fetch(sourceImage).then(res => res.blob());
-    const endpoint = normalizeEndpoint(AZURE_VISION_ENDPOINT);
-    const headers = {
-      'Content-Type': imageBlob.type || 'application/octet-stream',
-      'Ocp-Apim-Subscription-Key': AZURE_VISION_KEY,
-    };
-
-    const imageAnalysisUrl = `${endpoint}/computervision/imageanalysis:analyze?api-version=2024-02-01&features=read&language=${encodeURIComponent(AZURE_VISION_LANGUAGE)}`;
-
-    try {
-      const imageAnalysisResponse = await fetch(imageAnalysisUrl, {
-        method: 'POST',
-        headers,
-        body: imageBlob,
-      });
-
-      if (!imageAnalysisResponse.ok) {
-        const errorText = await imageAnalysisResponse.text();
-        if (imageAnalysisResponse.status === 429) {
-          throw new Error('RATE_LIMIT');
-        }
-
-        throw new Error(`Azure image analysis request failed: ${imageAnalysisResponse.status} ${errorText}`);
-      }
-
-      setOcrStatusMsg('Azure is reading text...');
-      setOcrProgress(85);
-
-      const payload = (await imageAnalysisResponse.json()) as AzureImageAnalysisResponse;
-      const lines = payload.readResult?.blocks?.flatMap(block => block.lines || []) || [];
-      const combinedText = lines.map(line => line.text || '').filter(Boolean).join('\n');
-      setOcrProgress(100);
-      return combinedText || 'No text was found in the image.';
-    } catch (imageAnalysisError: unknown) {
-      const imageAnalysisMessage = imageAnalysisError instanceof Error ? imageAnalysisError.message : '';
-      if (imageAnalysisMessage === 'RATE_LIMIT') {
-        throw imageAnalysisError;
-      }
-      console.warn('Azure image analysis endpoint failed, trying legacy endpoint.', imageAnalysisMessage);
-    }
-
-    setOcrStatusMsg('Trying legacy Azure OCR endpoint...');
-    setOcrProgress(25);
-
-    const analyzeUrl = `${endpoint}/vision/v3.2/read/analyze?language=${encodeURIComponent(AZURE_VISION_LANGUAGE)}`;
-    const analyzeResponse = await fetch(analyzeUrl, {
+    const response = await fetch('/api/ocr/azure', {
       method: 'POST',
-      headers,
+      headers: {
+        'Content-Type': imageBlob.type || 'application/octet-stream',
+      },
       body: imageBlob,
     });
 
-    if (!analyzeResponse.ok) {
-      const errorText = await analyzeResponse.text();
-      if (analyzeResponse.status === 429) {
+    if (!response.ok) {
+      let payload: AzureBackendOcrResponse | null = null;
+
+      try {
+        payload = (await response.json()) as AzureBackendOcrResponse;
+      } catch {
+        payload = null;
+      }
+
+      const errorCode = payload?.code || payload?.error || `HTTP_${response.status}`;
+
+      if (errorCode === 'RATE_LIMIT' || response.status === 429) {
         throw new Error('RATE_LIMIT');
       }
-      throw new Error(`Azure analyze request failed: ${analyzeResponse.status} ${errorText}`);
-    }
 
-    const operationLocation = analyzeResponse.headers.get('operation-location');
-    if (!operationLocation) {
-      throw new Error('Azure response did not include operation-location.');
+      throw new Error(errorCode);
     }
 
     setOcrStatusMsg('Azure is reading text...');
-    setOcrProgress(35);
+    setOcrProgress(85);
 
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      await sleep(1500);
-
-      const resultResponse = await fetch(operationLocation, {
-        method: 'GET',
-        headers: {
-          'Ocp-Apim-Subscription-Key': AZURE_VISION_KEY,
-        },
-      });
-
-      if (!resultResponse.ok) {
-        const errorText = await resultResponse.text();
-        if (resultResponse.status === 429) {
-          throw new Error('RATE_LIMIT');
-        }
-        throw new Error(`Azure status request failed: ${resultResponse.status} ${errorText}`);
-      }
-
-      const payload = (await resultResponse.json()) as AzureReadStatusResponse;
-      const statusValue = payload.status?.toLowerCase();
-
-      if (statusValue === 'succeeded') {
-        setOcrProgress(100);
-        const lines = payload.analyzeResult?.readResults?.flatMap(page => page.lines || []) || [];
-        const combinedText = lines.map(line => line.text || '').filter(Boolean).join('\n');
-        return combinedText || 'No text was found in the image.';
-      }
-
-      if (statusValue === 'failed') {
-        throw new Error('Azure OCR failed while processing the image.');
-      }
-
-      setOcrProgress(Math.min(95, 45 + attempt * 4));
-    }
-
-    throw new Error('Azure OCR timed out while waiting for the result.');
+    const payload = (await response.json()) as AzureBackendOcrResponse;
+    setOcrProgress(100);
+    return payload.text || 'No text was found in the image.';
   };
 
   // Extract text using Azure AI Vision first, then fallback to on-device OCR when needed
@@ -438,43 +393,44 @@ export default function App() {
     setOcrProgress(0);
     
     try {
-      const hasAzureEndpoint = Boolean(AZURE_VISION_ENDPOINT);
-      const hasAzureKey = Boolean(AZURE_VISION_KEY);
-      const azureConfigured = hasAzureEndpoint && hasAzureKey;
-      const shouldUseAzure = navigator.onLine && azureConfigured;
-
-      if (shouldUseAzure) {
+      if (navigator.onLine) {
         try {
           const azureText = await runAzureVisionOCR(sourceImage);
           setExtractedText(azureText);
           setOcrEngine('azure');
           setOcrFallbackReason('');
+          setAzureBackendStatus('configured');
           setStatus('done');
           return;
         } catch (azureError: unknown) {
           const msg = azureError instanceof Error ? azureError.message : '';
+          const normalizedMsg = msg.toLowerCase();
           const fallbackReason = toAzureFallbackReason(msg);
+
+          if (msg === 'AZURE_NOT_CONFIGURED') {
+            setAzureBackendStatus('not-configured');
+          }
+
+          if (normalizedMsg.includes('failed to fetch')) {
+            setAzureBackendStatus('unreachable');
+          }
+
           setOcrFallbackReason(fallbackReason);
+
           if (msg === 'RATE_LIMIT') {
             setOcrStatusMsg('Rate limit reached, switching to on-device OCR...');
+          } else if (msg === 'AZURE_NOT_CONFIGURED') {
+            setOcrStatusMsg('Backend not configured, switching to on-device OCR...');
           } else {
             setOcrStatusMsg('Azure unavailable, switching to on-device OCR...');
           }
+
           console.warn('Azure OCR fallback:', msg);
           setOcrProgress(0);
         }
-      } else if (!navigator.onLine) {
+      } else {
         setOcrFallbackReason('Device is offline.');
         setOcrStatusMsg('Offline mode: running on-device OCR...');
-      } else {
-        if (!hasAzureEndpoint && !hasAzureKey) {
-          setOcrFallbackReason('Azure endpoint and key are not loaded. Restart the dev server after editing .env.');
-        } else if (!hasAzureEndpoint) {
-          setOcrFallbackReason('Azure endpoint is missing. Check VITE_AZURE_CV_ENDPOINT.');
-        } else {
-          setOcrFallbackReason('Azure key is missing. Check VITE_AZURE_CV_KEY.');
-        }
-        setOcrStatusMsg('Azure not configured, running on-device OCR...');
       }
 
       const localText = await runTesseractOCR(sourceImage);
@@ -516,6 +472,31 @@ export default function App() {
       ? 'Source: Tesseract (on-device)'
       : 'Source: unavailable';
 
+  const azureBackendStatusLabel =
+    azureBackendStatus === 'configured'
+      ? 'Azure OCR backend: configured'
+      : azureBackendStatus === 'not-configured'
+      ? 'Azure OCR backend: missing server env'
+      : azureBackendStatus === 'unreachable'
+      ? 'Azure OCR backend: unavailable'
+      : 'Azure OCR backend: checking...';
+
+  const azureBackendStatusDetail =
+    azureBackendStatus === 'configured'
+      ? 'Using server-side VISION_ENDPOINT and VISION_KEY.'
+      : azureBackendStatus === 'not-configured'
+      ? 'Set VISION_ENDPOINT and VISION_KEY in .env and restart API server.'
+      : azureBackendStatus === 'unreachable'
+      ? 'Start the local API server to enable Azure OCR.'
+      : 'Checking /api/ocr/health...';
+
+  const azureStatusDotClass =
+    azureBackendStatus === 'configured'
+      ? 'bg-emerald-400'
+      : azureBackendStatus === 'checking'
+      ? 'bg-amber-300'
+      : 'bg-rose-400';
+
   const ocrSourceDetail = ocrEngine === 'tesseract' && ocrFallbackReason
     ? `Reason: ${ocrFallbackReason}`
     : null;
@@ -544,6 +525,20 @@ export default function App() {
           </motion.div>
           <h1 className="text-2xl font-medium tracking-tight text-[#f5f5f7] mb-2">Photo Note</h1>
           <p className="text-[#9aa0aa] text-sm tracking-wide font-medium">Transform images into editable notes.</p>
+        </div>
+
+        <div className="mb-6 rounded-2xl border border-white/5 bg-[#1c1d23] px-4 py-3 flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-[#f5f5f7] text-xs font-medium truncate">
+              {azureBackendStatusLabel}
+            </p>
+            <p className="text-[#9aa0aa] text-[11px] truncate">
+              {azureBackendStatusDetail}
+            </p>
+          </div>
+          <div className="flex-shrink-0">
+            <span className={`block w-2.5 h-2.5 rounded-full ${azureStatusDotClass}`} />
+          </div>
         </div>
 
         {/* Dynamic Content Area */}
