@@ -32,6 +32,14 @@ MAX_IMAGE_BYTES=10485760
 
 If you update `.env` while `npm run dev` is already running, restart the dev command so the API server reloads values.
 
+For backward compatibility, the backend also accepts these legacy names:
+
+```env
+VITE_AZURE_CV_ENDPOINT=...
+VITE_AZURE_CV_KEY=...
+VITE_AZURE_VISION_LANGUAGE=en
+```
+
 Then run:
 
 ```bash

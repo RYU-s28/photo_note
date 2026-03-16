@@ -21,6 +21,17 @@ const parseEnvNumber = (rawValue, fallback) => {
   return Number.isFinite(parsedValue) && parsedValue > 0 ? parsedValue : fallback;
 };
 
+const firstNonEmptyEnv = (...keys) => {
+  for (const key of keys) {
+    const value = (process.env[key] || '').trim();
+    if (value) {
+      return value;
+    }
+  }
+
+  return '';
+};
+
 const loadDotEnv = dotenvPath => {
   if (!fs.existsSync(dotenvPath)) {
     return;
@@ -61,9 +72,18 @@ loadDotEnv(path.join(workspaceRoot, '.env'));
 
 const getConfig = () => {
   return {
-    endpoint: (process.env.VISION_ENDPOINT || '').trim(),
-    key: (process.env.VISION_KEY || '').trim(),
-    language: (process.env.VISION_LANGUAGE || 'en').trim() || 'en',
+    endpoint: firstNonEmptyEnv(
+      'VISION_ENDPOINT',
+      'VITE_AZURE_CV_ENDPOINT',
+      'VITE_AZURE_VISION_ENDPOINT'
+    ),
+    key: firstNonEmptyEnv(
+      'VISION_KEY',
+      'VITE_AZURE_CV_KEY',
+      'VITE_AZURE_VISION_KEY'
+    ),
+    language:
+      firstNonEmptyEnv('VISION_LANGUAGE', 'VITE_AZURE_VISION_LANGUAGE') || 'en',
     port: parseEnvNumber(process.env.API_PORT || process.env.PORT, DEFAULT_PORT),
     maxImageBytes: parseEnvNumber(process.env.MAX_IMAGE_BYTES, DEFAULT_MAX_IMAGE_BYTES),
     timeoutMs: parseEnvNumber(process.env.AZURE_REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
