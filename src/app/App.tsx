@@ -1,6 +1,20 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Upload, FileText, Check, Copy, Loader2, X, ImagePlus, SwitchCamera, CameraOff } from 'lucide-react';
+import {
+  Upload,
+  FileText,
+  Check,
+  Copy,
+  Loader2,
+  X,
+  ImagePlus,
+  SwitchCamera,
+  CameraOff,
+  LogIn,
+  LogOut,
+  FileUp,
+  ExternalLink,
+} from 'lucide-react';
 import Tesseract from 'tesseract.js';
 
 type AppState = 'idle' | 'ready' | 'extracting' | 'done';
@@ -22,9 +36,73 @@ type AzureBackendHealthResponse = {
 
 type AzureBackendStatus = 'checking' | 'configured' | 'not-configured' | 'unreachable';
 
+type GoogleAuthStatus = 'disabled' | 'loading' | 'ready' | 'error';
+
+type GoogleExportStatus =
+  | 'idle'
+  | 'authorizing'
+  | 'creating-doc'
+  | 'writing-doc'
+  | 'done'
+  | 'error';
+
+type GoogleTokenResponse = {
+  access_token?: string;
+  expires_in?: number;
+  error?: string;
+  error_description?: string;
+};
+
+type GoogleTokenClient = {
+  requestAccessToken: (options?: { prompt?: '' | 'consent' }) => void;
+};
+
+type GoogleOauth2 = {
+  initTokenClient: (config: {
+    client_id: string;
+    scope: string;
+    callback: (response: GoogleTokenResponse) => void;
+    error_callback?: (error: { type?: string }) => void;
+  }) => GoogleTokenClient;
+  revoke: (token: string, done?: () => void) => void;
+};
+
+type GoogleApiWindow = Window & {
+  google?: {
+    accounts?: {
+      oauth2?: GoogleOauth2;
+    };
+  };
+};
+
+type GoogleDriveFileCreateResponse = {
+  id?: string;
+  webViewLink?: string;
+};
+
+type GoogleApiErrorResponse = {
+  error?: {
+    message?: string;
+  } | string;
+};
+
+type AppEnv = {
+  VITE_API_BASE_URL?: string;
+  VITE_GOOGLE_CLIENT_ID?: string;
+  VITE_GOOGLE_DRIVE_FOLDER_ID?: string;
+};
+
 const MIN_CAMERA_ZOOM = 1;
 const MAX_CAMERA_ZOOM = 3;
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+const appEnv = (import.meta as { env?: AppEnv }).env || {};
+const API_BASE_URL = (appEnv.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+const GOOGLE_CLIENT_ID = (appEnv.VITE_GOOGLE_CLIENT_ID || '').trim();
+const GOOGLE_DRIVE_FOLDER_ID = (appEnv.VITE_GOOGLE_DRIVE_FOLDER_ID || '').trim();
+const GOOGLE_OAUTH_SCOPES = [
+  'https://www.googleapis.com/auth/drive.file',
+  'https://www.googleapis.com/auth/documents',
+].join(' ');
+const GOOGLE_IDENTITY_SCRIPT_SRC = 'https://accounts.google.com/gsi/client';
 
 const clampZoom = (zoomValue: number) => Math.min(MAX_CAMERA_ZOOM, Math.max(MIN_CAMERA_ZOOM, zoomValue));
 const getApiUrl = (path: string) => `${API_BASE_URL}${path}`;
@@ -94,6 +172,107 @@ const toAzureFallbackReason = (errorMessage: string) => {
   return 'Azure OCR request failed.';
 };
 
+const normalizeExtractedText = (text: string) => {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+};
+
+const buildGoogleDocTitle = () => {
+  const now = new Date();
+  const date = now.toLocaleDateString();
+  const time = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return `Photo Note ${date} ${time}`;
+};
+
+const loadGoogleIdentityScript = async () => {
+  const googleWindow = window as GoogleApiWindow;
+  if (googleWindow.google?.accounts?.oauth2) {
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timeoutId: number | null = null;
+
+    const settle = (next: () => void) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+
+      next();
+    };
+
+    const onReady = () => {
+      const oauth2 = (window as GoogleApiWindow).google?.accounts?.oauth2;
+      if (!oauth2) {
+        settle(() => reject(new Error('Google Identity Services is unavailable.')));
+        return;
+      }
+
+      settle(resolve);
+    };
+
+    const onError = () => {
+      settle(() => reject(new Error('Failed to load Google Identity Services script.')));
+    };
+
+    const existingScript = document.querySelector<HTMLScriptElement>(
+      `script[src="${GOOGLE_IDENTITY_SCRIPT_SRC}"]`
+    );
+
+    if (existingScript) {
+      if ((window as GoogleApiWindow).google?.accounts?.oauth2) {
+        resolve();
+        return;
+      }
+
+      existingScript.addEventListener('load', onReady, { once: true });
+      existingScript.addEventListener('error', onError, { once: true });
+      timeoutId = window.setTimeout(onReady, 3000);
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.src = GOOGLE_IDENTITY_SCRIPT_SRC;
+    script.async = true;
+    script.defer = true;
+    script.addEventListener('load', onReady, { once: true });
+    script.addEventListener('error', onError, { once: true });
+    document.head.appendChild(script);
+  });
+};
+
+const toGoogleApiErrorMessage = async (response: Response, fallbackMessage: string) => {
+  try {
+    const payload = (await response.json()) as GoogleApiErrorResponse;
+
+    if (typeof payload.error === 'string' && payload.error.trim()) {
+      return `${payload.error.trim()} (HTTP ${response.status})`;
+    }
+
+    if (
+      payload.error &&
+      typeof payload.error === 'object' &&
+      typeof payload.error.message === 'string' &&
+      payload.error.message.trim()
+    ) {
+      return `${payload.error.message.trim()} (HTTP ${response.status})`;
+    }
+  } catch {
+    // Ignore JSON parse failures and return fallback message.
+  }
+
+  return `${fallbackMessage} (HTTP ${response.status})`;
+};
+
 export default function App() {
   const [status, setStatus] = useState<AppState>('idle');
   const [imageSrc, setImageSrc] = useState<string | null>(null);
@@ -114,6 +293,15 @@ export default function App() {
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
   const [cameraZoom, setCameraZoom] = useState<number>(1);
   const [isDragging, setIsDragging] = useState(false);
+  const [googleAuthStatus, setGoogleAuthStatus] = useState<GoogleAuthStatus>(
+    GOOGLE_CLIENT_ID ? 'loading' : 'disabled'
+  );
+  const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(null);
+  const [googleAccessTokenExpiresAt, setGoogleAccessTokenExpiresAt] = useState(0);
+  const [googleExportStatus, setGoogleExportStatus] = useState<GoogleExportStatus>('idle');
+  const [googleExportError, setGoogleExportError] = useState('');
+  const [googleDocUrl, setGoogleDocUrl] = useState('');
+  const [googleDocTitle, setGoogleDocTitle] = useState('');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -121,6 +309,13 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const pinchStartDistanceRef = useRef<number | null>(null);
   const pinchStartZoomRef = useRef<number>(1);
+
+  const resetGoogleExportFeedback = () => {
+    setGoogleExportStatus('idle');
+    setGoogleExportError('');
+    setGoogleDocUrl('');
+    setGoogleDocTitle('');
+  };
 
   const startCamera = async (mode: 'environment' | 'user') => {
     stopCamera();
@@ -240,6 +435,7 @@ export default function App() {
         const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
         setImageSrc(dataUrl);
         setStatus('ready');
+        resetGoogleExportFeedback();
       }
     }
   };
@@ -263,6 +459,7 @@ export default function App() {
       setOcrFallbackReason('');
       setOcrProgress(0);
       setCopied(false);
+      resetGoogleExportFeedback();
     };
     reader.readAsDataURL(file);
 
@@ -380,6 +577,286 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let isCancelled = false;
+
+    if (!GOOGLE_CLIENT_ID) {
+      setGoogleAuthStatus('disabled');
+      return;
+    }
+
+    const initializeGoogleIdentity = async () => {
+      setGoogleAuthStatus('loading');
+
+      try {
+        await loadGoogleIdentityScript();
+
+        if (!isCancelled) {
+          setGoogleAuthStatus('ready');
+        }
+      } catch (error) {
+        console.error('Google Identity init error:', error);
+
+        if (!isCancelled) {
+          setGoogleAuthStatus('error');
+          setGoogleExportError('Google Sign-In is unavailable. Check your OAuth client setup.');
+        }
+      }
+    };
+
+    initializeGoogleIdentity();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
+  const getGoogleOauth2 = () => {
+    const oauth2 = (window as GoogleApiWindow).google?.accounts?.oauth2;
+    if (!oauth2) {
+      throw new Error('Google Sign-In is not ready yet.');
+    }
+
+    return oauth2;
+  };
+
+  const requestGoogleAccessToken = async (prompt: '' | 'consent') => {
+    if (!GOOGLE_CLIENT_ID) {
+      throw new Error('Google Docs export is not configured.');
+    }
+
+    const oauth2 = getGoogleOauth2();
+
+    const tokenResponse = await new Promise<GoogleTokenResponse>((resolve, reject) => {
+      const tokenClient = oauth2.initTokenClient({
+        client_id: GOOGLE_CLIENT_ID,
+        scope: GOOGLE_OAUTH_SCOPES,
+        callback: response => resolve(response),
+        error_callback: () => reject(new Error('Google sign-in was canceled or blocked.')),
+      });
+
+      tokenClient.requestAccessToken({ prompt });
+    });
+
+    if (!tokenResponse.access_token) {
+      throw new Error(
+        tokenResponse.error_description ||
+          tokenResponse.error ||
+          'Failed to receive a Google access token.'
+      );
+    }
+
+    const expiresInSeconds = Number(tokenResponse.expires_in) || 3600;
+    setGoogleAccessToken(tokenResponse.access_token);
+    setGoogleAccessTokenExpiresAt(Date.now() + expiresInSeconds * 1000);
+    setGoogleAuthStatus('ready');
+
+    return tokenResponse.access_token;
+  };
+
+  const ensureGoogleAccessToken = async () => {
+    const hasValidToken =
+      Boolean(googleAccessToken) && googleAccessTokenExpiresAt > Date.now() + 15000;
+
+    if (hasValidToken && googleAccessToken) {
+      return googleAccessToken;
+    }
+
+    return requestGoogleAccessToken(googleAccessToken ? '' : 'consent');
+  };
+
+  const createGoogleDoc = async (accessToken: string, title: string) => {
+    const requestBody: {
+      name: string;
+      mimeType: string;
+      parents?: string[];
+    } = {
+      name: title,
+      mimeType: 'application/vnd.google-apps.document',
+    };
+
+    if (GOOGLE_DRIVE_FOLDER_ID) {
+      requestBody.parents = [GOOGLE_DRIVE_FOLDER_ID];
+    }
+
+    const response = await fetch('https://www.googleapis.com/drive/v3/files?fields=id,webViewLink', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      throw new Error(await toGoogleApiErrorMessage(response, 'Failed to create a Google Doc'));
+    }
+
+    const createdDoc = (await response.json()) as GoogleDriveFileCreateResponse;
+
+    if (!createdDoc.id) {
+      throw new Error('Google Drive API did not return a document ID.');
+    }
+
+    return createdDoc;
+  };
+
+  const insertTextIntoGoogleDoc = async (accessToken: string, documentId: string, rawText: string) => {
+    const heading = 'Photo Note OCR';
+    const subtitle = `Created ${new Date().toLocaleString()}`;
+    const body = normalizeExtractedText(rawText) || 'No text was extracted.';
+    const composedText = `${heading}\n${subtitle}\n\n${body}\n`;
+
+    const headingStart = 1;
+    const headingEnd = headingStart + heading.length;
+    const subtitleStart = headingEnd + 1;
+    const subtitleEnd = subtitleStart + subtitle.length;
+
+    const response = await fetch(`https://docs.googleapis.com/v1/documents/${documentId}:batchUpdate`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        requests: [
+          {
+            insertText: {
+              location: { index: 1 },
+              text: composedText,
+            },
+          },
+          {
+            updateParagraphStyle: {
+              range: {
+                startIndex: headingStart,
+                endIndex: headingEnd,
+              },
+              paragraphStyle: {
+                namedStyleType: 'HEADING_1',
+              },
+              fields: 'namedStyleType',
+            },
+          },
+          {
+            updateParagraphStyle: {
+              range: {
+                startIndex: subtitleStart,
+                endIndex: subtitleEnd,
+              },
+              paragraphStyle: {
+                namedStyleType: 'SUBTITLE',
+              },
+              fields: 'namedStyleType',
+            },
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        await toGoogleApiErrorMessage(response, 'Failed to insert OCR text into the Google Doc')
+      );
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    if (!GOOGLE_CLIENT_ID) {
+      setGoogleExportStatus('error');
+      setGoogleExportError('Set VITE_GOOGLE_CLIENT_ID to enable Google Docs export.');
+      return;
+    }
+
+    setGoogleExportError('');
+    setGoogleExportStatus('authorizing');
+
+    try {
+      await requestGoogleAccessToken('consent');
+      setGoogleExportStatus('idle');
+    } catch (error) {
+      console.error('Google sign-in error:', error);
+      setGoogleExportStatus('error');
+      setGoogleExportError(
+        error instanceof Error ? error.message : 'Google sign-in failed. Please try again.'
+      );
+    }
+  };
+
+  const handleGoogleDisconnect = () => {
+    try {
+      if (googleAccessToken) {
+        getGoogleOauth2().revoke(googleAccessToken);
+      }
+    } catch (error) {
+      console.warn('Google disconnect warning:', error);
+    }
+
+    setGoogleAccessToken(null);
+    setGoogleAccessTokenExpiresAt(0);
+    resetGoogleExportFeedback();
+  };
+
+  const handleExportToGoogleDocs = async () => {
+    const normalizedText = normalizeExtractedText(extractedText);
+
+    if (!normalizedText) {
+      setGoogleExportStatus('error');
+      setGoogleExportError('Nothing to export yet. Extract text first.');
+      return;
+    }
+
+    if (!GOOGLE_CLIENT_ID) {
+      setGoogleExportStatus('error');
+      setGoogleExportError('Set VITE_GOOGLE_CLIENT_ID to enable Google Docs export.');
+      return;
+    }
+
+    resetGoogleExportFeedback();
+    setGoogleExportStatus('authorizing');
+
+    try {
+      let accessToken = await ensureGoogleAccessToken();
+
+      const createAndPopulate = async (token: string) => {
+        setGoogleExportStatus('creating-doc');
+        const title = buildGoogleDocTitle();
+        const createdDoc = await createGoogleDoc(token, title);
+
+        setGoogleExportStatus('writing-doc');
+        await insertTextIntoGoogleDoc(token, createdDoc.id!, normalizedText);
+
+        const docUrl = createdDoc.webViewLink || `https://docs.google.com/document/d/${createdDoc.id}/edit`;
+        setGoogleDocTitle(title);
+        setGoogleDocUrl(docUrl);
+      };
+
+      try {
+        await createAndPopulate(accessToken);
+      } catch (error) {
+        const message = error instanceof Error ? error.message.toLowerCase() : '';
+        const unauthorized = message.includes('http 401');
+
+        if (!unauthorized) {
+          throw error;
+        }
+
+        accessToken = await requestGoogleAccessToken('consent');
+        await createAndPopulate(accessToken);
+      }
+
+      setGoogleExportStatus('done');
+    } catch (error) {
+      console.error('Google Docs export error:', error);
+      setGoogleExportStatus('error');
+      setGoogleExportError(
+        error instanceof Error
+          ? error.message
+          : 'Could not export notes to Google Docs. Please try again.'
+      );
+    }
+  };
+
   const runTesseractOCR = async (sourceImage: string) => {
     const result = await Tesseract.recognize(
       sourceImage,
@@ -455,6 +932,7 @@ export default function App() {
     setOcrFallbackReason('');
     setOcrStatusMsg('Preparing image...');
     setOcrProgress(0);
+    resetGoogleExportFeedback();
     
     try {
       if (navigator.onLine) {
@@ -528,6 +1006,7 @@ export default function App() {
     setOcrFallbackReason('');
     setOcrProgress(0);
     setCameraZoom(1);
+    resetGoogleExportFeedback();
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -574,6 +1053,46 @@ export default function App() {
   const ocrSourceDetail = ocrEngine === 'tesseract' && ocrFallbackReason
     ? `Reason: ${ocrFallbackReason}`
     : null;
+
+  const googleIsBusy =
+    googleExportStatus === 'authorizing' ||
+    googleExportStatus === 'creating-doc' ||
+    googleExportStatus === 'writing-doc';
+
+  const googleConnected =
+    Boolean(googleAccessToken) && googleAccessTokenExpiresAt > Date.now() + 10000;
+
+  const hasExportableText = normalizeExtractedText(extractedText).length > 0;
+
+  const googleStatusLabel =
+    googleAuthStatus === 'disabled'
+      ? 'Google Docs export is disabled'
+      : googleAuthStatus === 'loading'
+      ? 'Loading Google Sign-In...'
+      : googleAuthStatus === 'error'
+      ? 'Google Sign-In unavailable'
+      : googleConnected
+      ? 'Google account connected'
+      : 'Google account not connected';
+
+  const googleStatusDetail =
+    googleAuthStatus === 'disabled'
+      ? 'Set VITE_GOOGLE_CLIENT_ID to enable Docs export.'
+      : googleExportStatus === 'authorizing'
+      ? 'Waiting for Google OAuth permission...'
+      : googleExportStatus === 'creating-doc'
+      ? 'Creating a new Google Doc in Drive...'
+      : googleExportStatus === 'writing-doc'
+      ? 'Inserting OCR text and formatting...'
+      : googleExportStatus === 'done'
+      ? 'Document created successfully.'
+      : GOOGLE_DRIVE_FOLDER_ID
+      ? `Docs will be created in folder ${GOOGLE_DRIVE_FOLDER_ID}.`
+      : 'Docs will be created at the root of your Google Drive.';
+
+  const googleConnectionPillClass = googleConnected
+    ? 'border-emerald-400/30 text-emerald-300 bg-emerald-500/10'
+    : 'border-white/15 text-[#9aa0aa] bg-white/[0.03]';
 
   return (
     <div className="min-h-screen bg-[#0b0b0f] text-[#f5f5f7] flex items-center justify-center p-4 sm:p-8 font-sans antialiased selection:bg-[#4da3ff]/30">
@@ -862,6 +1381,85 @@ export default function App() {
                         {copied ? 'Copied' : 'Copy'}
                       </button>
                     </div>
+                  </div>
+                </div>
+
+                {/* Google Docs Export */}
+                <div className="bg-[#1c1d23] border border-white/5 rounded-3xl p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-[#f5f5f7] text-sm font-medium truncate">Google Docs Export</p>
+                      <p className="text-[#9aa0aa] text-xs truncate">{googleStatusLabel}</p>
+                    </div>
+                    <span
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] rounded-full border ${googleConnectionPillClass}`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full ${googleConnected ? 'bg-emerald-300' : 'bg-[#7f8692]'}`} />
+                      {googleConnected ? 'Connected' : 'Not connected'}
+                    </span>
+                  </div>
+
+                  <p className="text-[#7f8692] text-[11px]">{googleStatusDetail}</p>
+
+                  {googleExportError ? (
+                    <p className="text-rose-200 text-xs bg-rose-500/10 border border-rose-500/20 rounded-xl px-3 py-2">
+                      {googleExportError}
+                    </p>
+                  ) : null}
+
+                  {googleDocUrl ? (
+                    <a
+                      href={googleDocUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-2 px-3 py-2 bg-[#15161b] text-[#4da3ff] border border-[#4da3ff]/25 rounded-xl text-xs font-medium hover:bg-[#4da3ff]/10 transition-colors"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      {googleDocTitle ? `Open ${googleDocTitle}` : 'Open Google Doc'}
+                    </a>
+                  ) : null}
+
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      onClick={handleGoogleSignIn}
+                      disabled={googleAuthStatus !== 'ready' || googleIsBusy}
+                      className="inline-flex items-center gap-2 px-3.5 py-2 bg-white/[0.04] text-[#f5f5f7] border border-white/10 rounded-xl text-xs font-medium hover:bg-white/[0.08] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      {googleIsBusy && googleExportStatus === 'authorizing' ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <LogIn className="w-3.5 h-3.5" />
+                      )}
+                      {googleConnected ? 'Re-auth Google' : 'Sign in with Google'}
+                    </button>
+
+                    <button
+                      onClick={handleExportToGoogleDocs}
+                      disabled={googleAuthStatus !== 'ready' || googleIsBusy || !hasExportableText}
+                      className="inline-flex items-center gap-2 px-3.5 py-2 bg-[#4da3ff] text-[#0b0b0f] border border-[#4da3ff]/80 rounded-xl text-xs font-medium hover:bg-[#4da3ff]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      {googleExportStatus === 'creating-doc' || googleExportStatus === 'writing-doc' ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <FileUp className="w-3.5 h-3.5" />
+                      )}
+                      {googleExportStatus === 'creating-doc'
+                        ? 'Creating Doc...'
+                        : googleExportStatus === 'writing-doc'
+                        ? 'Writing Notes...'
+                        : 'Create Google Doc'}
+                    </button>
+
+                    {googleConnected ? (
+                      <button
+                        onClick={handleGoogleDisconnect}
+                        disabled={googleIsBusy}
+                        className="inline-flex items-center gap-2 px-3.5 py-2 bg-white/[0.02] text-[#9aa0aa] border border-white/10 rounded-xl text-xs font-medium hover:bg-white/[0.06] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      >
+                        <LogOut className="w-3.5 h-3.5" />
+                        Disconnect
+                      </button>
+                    ) : null}
                   </div>
                 </div>
               </motion.div>

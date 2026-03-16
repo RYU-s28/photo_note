@@ -7,6 +7,37 @@ Photo Note extracts text from images.
 - Primary OCR: Azure Computer Vision through a secure backend endpoint
 - Fallback OCR: Tesseract.js (offline or when Azure is unavailable)
 
+## Google Docs export flow
+
+After OCR is complete in the app:
+
+1. User signs in with Google (OAuth 2.0 popup)
+2. App creates a new Google Doc via Drive API
+3. App inserts cleaned OCR text via Docs API
+
+Required OAuth scopes:
+
+- `https://www.googleapis.com/auth/drive.file`
+- `https://www.googleapis.com/auth/documents`
+
+### Google OAuth setup
+
+1. In Google Cloud Console, create an OAuth 2.0 Client ID of type **Web application**.
+2. Add authorized JavaScript origins for your app, for example:
+	- `http://localhost:5173`
+	- `http://127.0.0.1:5173`
+3. Copy `.env.example` to `.env` if you have not already.
+4. Set:
+
+```env
+VITE_GOOGLE_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
+
+# Optional: create new docs in a specific Drive folder
+VITE_GOOGLE_DRIVE_FOLDER_ID=
+```
+
+`VITE_GOOGLE_CLIENT_ID` is a frontend value and is expected to be public in the browser bundle.
+
 ## Secure backend architecture
 
 - Browser uploads image bytes to `POST /api/ocr/azure`.

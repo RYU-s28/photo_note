@@ -65,6 +65,19 @@
         "cwd": "${workspaceFolder}"
       },
       "problemMatcher": []
+    },
+    {
+      "label": "photo-note: build",
+      "type": "shell",
+      "command": "npm",
+      "args": [
+        "run",
+        "build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
     }
   ]
 }

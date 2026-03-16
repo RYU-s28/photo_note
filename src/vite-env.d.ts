@@ -2,6 +2,8 @@
 
 interface ImportMetaEnv {
   readonly VITE_API_BASE_URL?: string;
+  readonly VITE_GOOGLE_CLIENT_ID?: string;
+  readonly VITE_GOOGLE_DRIVE_FOLDER_ID?: string;
   readonly VITE_AZURE_CV_ENDPOINT?: string;
   readonly VITE_AZURE_CV_KEY?: string;
   readonly VITE_AZURE_VISION_ENDPOINT?: string;
