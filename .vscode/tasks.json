@@ -7,8 +7,11 @@
       "command": "bash",
       "args": [
         "-lc",
-        "mkdir -p .copilot-tmp && rm -f .copilot-tmp/stopped-pids.txt .copilot-tmp/post-stop-processes.txt && pids=$(ps -eo pid=,cmd= | awk '/\\/workspaces\\/photo_note/ && (/vite/ || /server\\/index\\.mjs/ || /npm run dev/) { print $1 }'); if [ -n \"$pids\" ]; then printf '%s\\n' \"$pids\" > .copilot-tmp/stopped-pids.txt; kill $pids 2>/dev/null || true; sleep 2; survivors=$(ps -o pid= -p $pids 2>/dev/null | tr -d \" \" | sed '/^$/d'); if [ -n \"$survivors\" ]; then kill -9 $survivors 2>/dev/null || true; fi; else : > .copilot-tmp/stopped-pids.txt; fi; ps -eo pid=,cmd= | awk '/\\/workspaces\\/photo_note/ && (/vite/ || /server\\/index\\.mjs/ || /npm run dev/)' > .copilot-tmp/post-stop-processes.txt || true"
+        "mkdir -p .copilot-tmp && rm -f .copilot-tmp/stopped-pids.txt .copilot-tmp/post-stop-processes.txt && pids=$(ps -eo pid=,cmd= | awk \"/\\/workspaces\\/photo_note/ && (/vite/ || /server\\/index\\.mjs/ || /npm run dev/) { print \\\$1 }\"); if [ -n \"$pids\" ]; then printf \"%s\\n\" \"$pids\" > .copilot-tmp/stopped-pids.txt; kill $pids 2>/dev/null || true; sleep 2; survivors=$(ps -o pid= -p $pids 2>/dev/null | tr -d \" \" | sed \"/^$/d\"); if [ -n \"$survivors\" ]; then kill -9 $survivors 2>/dev/null || true; fi; else : > .copilot-tmp/stopped-pids.txt; fi; ps -eo pid=,cmd= | awk \"/\\/workspaces\\/photo_note/ && (/vite/ || /server\\/index\\.mjs/ || /npm run dev/)\" > .copilot-tmp/post-stop-processes.txt || true"
       ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
       "problemMatcher": []
     },
     {
@@ -17,8 +20,11 @@
       "command": "bash",
       "args": [
         "-lc",
-        "mkdir -p .copilot-tmp && rm -f .copilot-tmp/dev-server.pid .copilot-tmp/start-process.txt .copilot-tmp/dev-server.log && nohup npm run dev > .copilot-tmp/dev-server.log 2>&1 & echo $! > .copilot-tmp/dev-server.pid && sleep 5 && pid=$(cat .copilot-tmp/dev-server.pid) && ps -p \"$pid\" -o pid=,cmd= > .copilot-tmp/start-process.txt || true"
+        "mkdir -p .copilot-tmp && rm -f .copilot-tmp/dev-server.pid .copilot-tmp/start-process.txt .copilot-tmp/dev-server.log; nohup npm run dev > .copilot-tmp/dev-server.log 2>&1 < /dev/null & pid=$!; echo $pid > .copilot-tmp/dev-server.pid; sleep 5; ps -p \"$pid\" -o pid=,cmd= > .copilot-tmp/start-process.txt || true"
       ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
       "problemMatcher": []
     },
     {
@@ -27,8 +33,37 @@
       "command": "bash",
       "args": [
         "-lc",
-        "mkdir -p .copilot-tmp && { echo '[processes]'; ps -eo pid=,cmd= | awk '/\\/workspaces\\/photo_note/ && (/vite/ || /server\\/index\\.mjs/ || /npm run dev/)' || true; echo; echo '[ports]'; lsof -nP -iTCP -sTCP:LISTEN | awk '/node|vite/' || true; echo; echo '[log tail]'; tail -n 40 .copilot-tmp/dev-server.log 2>/dev/null || true; } > .copilot-tmp/dev-status.txt"
+        "mkdir -p .copilot-tmp && { echo \"[processes]\"; ps -eo pid=,cmd= | awk \"/\\/workspaces\\/photo_note/ && (/vite/ || /server\\/index\\.mjs/ || /npm run dev/)\" || true; echo; echo \"[ports]\"; lsof -nP -iTCP -sTCP:LISTEN | awk \"/node|vite/\" || true; echo; echo \"[log tail]\"; tail -n 40 .copilot-tmp/dev-server.log 2>/dev/null || true; } > .copilot-tmp/dev-status.txt"
       ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "photo-note: start-api",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "mkdir -p .copilot-tmp && rm -f .copilot-tmp/api-server.pid .copilot-tmp/api-start-process.txt .copilot-tmp/api-server.log; nohup npm run dev:api > .copilot-tmp/api-server.log 2>&1 < /dev/null & pid=$!; echo $pid > .copilot-tmp/api-server.pid; sleep 3; ps -p \"$pid\" -o pid=,cmd= > .copilot-tmp/api-start-process.txt || true"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "photo-note: verify-api",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "mkdir -p .copilot-tmp && { echo \"[processes]\"; ps -eo pid=,cmd= | awk \"/\\/workspaces\\/photo_note/ && /server\\/index\\.mjs/\" || true; echo; echo \"[ports]\"; lsof -nP -iTCP -sTCP:LISTEN | awk \"/node|:8787/\" || true; echo; echo \"[health]\"; curl -sf http://127.0.0.1:8787/api/ocr/health || true; echo; echo \"[log tail]\"; tail -n 40 .copilot-tmp/api-server.log 2>/dev/null || true; } > .copilot-tmp/api-status.txt"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
       "problemMatcher": []
     }
   ]

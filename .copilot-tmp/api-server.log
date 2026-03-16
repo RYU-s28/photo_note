@@ -1,0 +1,5 @@
+
+> @figma/my-make-file@0.0.1 dev:api
+> node server/index.mjs
+
+[api] OCR backend listening on http://localhost:8787
