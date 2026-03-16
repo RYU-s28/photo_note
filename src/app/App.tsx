@@ -244,16 +244,38 @@ export default function App() {
     }
   };
 
+  const setSelectedImage = (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const result = event.target?.result;
+      if (typeof result !== 'string') {
+        return;
+      }
+
+      setImageSrc(result);
+      setStatus('ready');
+      setExtractedText('');
+      setOcrEngine(null);
+      setOcrFallbackReason('');
+      setOcrProgress(0);
+      setCopied(false);
+    };
+    reader.readAsDataURL(file);
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
   // Handle manual file selection
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        setImageSrc(event.target?.result as string);
-        setStatus('ready');
-      };
-      reader.readAsDataURL(file);
+      setSelectedImage(file);
     }
   };
 
@@ -275,15 +297,44 @@ export default function App() {
     e.stopPropagation();
     setIsDragging(false);
     const file = e.dataTransfer.files?.[0];
-    if (file && file.type.startsWith('image/')) {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        setImageSrc(event.target?.result as string);
-        setStatus('ready');
-      };
-      reader.readAsDataURL(file);
+    if (file) {
+      setSelectedImage(file);
     }
   };
+
+  useEffect(() => {
+    const handlePaste = (event: ClipboardEvent) => {
+      if (status === 'extracting') {
+        return;
+      }
+
+      const clipboardItems = event.clipboardData?.items;
+      if (!clipboardItems) {
+        return;
+      }
+
+      for (let index = 0; index < clipboardItems.length; index += 1) {
+        const item = clipboardItems[index];
+        if (item.kind !== 'file' || !item.type.startsWith('image/')) {
+          continue;
+        }
+
+        const pastedImage = item.getAsFile();
+        if (!pastedImage) {
+          continue;
+        }
+
+        event.preventDefault();
+        setSelectedImage(pastedImage);
+        break;
+      }
+    };
+
+    window.addEventListener('paste', handlePaste);
+    return () => {
+      window.removeEventListener('paste', handlePaste);
+    };
+  }, [status]);
 
   useEffect(() => {
     if (status !== 'idle' || !isCameraActive || isCameraPreviewReady) {
@@ -618,6 +669,7 @@ export default function App() {
                     >
                       Browse Files
                     </button>
+                    <p className="text-[#7f8692] text-[11px] mt-4 text-center">Tip: Press Ctrl+V to paste a screenshot</p>
                   </div>
                 ) : (
                   // Camera View UI
@@ -645,6 +697,10 @@ export default function App() {
 
                     <div className="absolute top-3 right-3 z-10 px-2.5 py-1 rounded-full bg-black/35 text-white/85 text-[11px] font-medium backdrop-blur-sm border border-white/15">
                       Pinch to zoom
+                    </div>
+
+                    <div className="absolute top-11 right-3 z-10 px-2.5 py-1 rounded-full bg-black/35 text-white/85 text-[11px] font-medium backdrop-blur-sm border border-white/15">
+                      Ctrl+V to paste screenshot
                     </div>
 
                     {!isCameraPreviewReady && (

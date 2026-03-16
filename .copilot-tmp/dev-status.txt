@@ -1,0 +1,8 @@
+[processes]
+  23579 node /workspaces/photo_note/node_modules/.bin/concurrently -k -n API,WEB -c green,cyan npm run dev:api npm run dev:web
+  23623 node /workspaces/photo_note/node_modules/.bin/vite --host 0.0.0.0 --port 5173
+
+[ports]
+node        605 codespace   21u  IPv4  30242      0t0  TCP 127.0.0.1:33165 (LISTEN)
+
+[log tail]
