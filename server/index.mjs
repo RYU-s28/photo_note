@@ -17,6 +17,15 @@ const DEFAULT_MAX_POLL_ATTEMPTS = 12;
 const normalizeEndpoint = endpoint => endpoint.replace(/\/+$/, '');
 const normalizeOrigin = origin => origin.trim().replace(/\/+$/, '').toLowerCase();
 
+const isValidHttpUrl = value => {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+};
+
 const parseEnvNumber = (rawValue, fallback) => {
   const parsedValue = Number(rawValue);
   return Number.isFinite(parsedValue) && parsedValue > 0 ? parsedValue : fallback;
@@ -397,6 +406,7 @@ app.get('/api/ocr/health', (_req, res) => {
   res.json({
     ok: true,
     azureConfigured: configured,
+    endpointValid: !config.endpoint || isValidHttpUrl(config.endpoint),
     language: config.language,
     maxImageBytes: config.maxImageBytes,
   });
@@ -416,6 +426,14 @@ app.post(
       res.status(503).json({
         error: 'Azure OCR backend is not configured.',
         code: 'AZURE_NOT_CONFIGURED',
+      });
+      return;
+    }
+
+    if (!isValidHttpUrl(config.endpoint)) {
+      res.status(503).json({
+        error: 'Azure endpoint is invalid. Use full https://<resource>.cognitiveservices.azure.com URL.',
+        code: 'AZURE_ENDPOINT_INVALID',
       });
       return;
     }
@@ -509,9 +527,17 @@ app.post(
         return;
       }
 
+      const errorDetails =
+        error instanceof Error && typeof error.message === 'string' && error.message.trim()
+          ? error.message.trim()
+          : 'Unknown error';
+
+      console.error('[api] Azure OCR request failed:', errorDetails);
+
       res.status(502).json({
         error: 'Azure OCR request failed.',
         code: 'AZURE_REQUEST_FAILED',
+        details: errorDetails,
       });
     }
   }

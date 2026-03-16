@@ -13,6 +13,7 @@ type AzureBackendOcrResponse = {
   modelVersion?: string | null;
   error?: string;
   code?: string;
+  details?: string;
 };
 
 type AzureBackendHealthResponse = {
@@ -56,6 +57,10 @@ const toAzureFallbackReason = (errorMessage: string) => {
 
   if (errorMessage === 'AZURE_ENDPOINT_UNAVAILABLE') {
     return 'Azure endpoint path is not available for this resource.';
+  }
+
+  if (errorMessage === 'AZURE_ENDPOINT_INVALID') {
+    return 'Backend VISION_ENDPOINT is invalid.';
   }
 
   if (errorMessage === 'AZURE_BAD_REQUEST') {
@@ -367,9 +372,15 @@ export default function App() {
       }
 
       const errorCode = payload?.code || payload?.error || `HTTP_${response.status}`;
+      const errorDetails =
+        typeof payload?.details === 'string' ? payload.details.trim() : '';
 
       if (errorCode === 'RATE_LIMIT' || response.status === 429) {
         throw new Error('RATE_LIMIT');
+      }
+
+      if (errorDetails) {
+        throw new Error(`${errorCode}::${errorDetails}`);
       }
 
       throw new Error(errorCode);
@@ -405,29 +416,33 @@ export default function App() {
           setStatus('done');
           return;
         } catch (azureError: unknown) {
-          const msg = azureError instanceof Error ? azureError.message : '';
-          const normalizedMsg = msg.toLowerCase();
-          const fallbackReason = toAzureFallbackReason(msg);
+          const rawMessage = azureError instanceof Error ? azureError.message : '';
+          const [errorCode, errorDetails] = rawMessage.split('::', 2);
+          const normalizedCode = errorCode.toLowerCase();
+          const fallbackReasonBase = toAzureFallbackReason(errorCode);
+          const fallbackReason = errorDetails
+            ? `${fallbackReasonBase} Details: ${errorDetails}`
+            : fallbackReasonBase;
 
-          if (msg === 'AZURE_NOT_CONFIGURED') {
+          if (errorCode === 'AZURE_NOT_CONFIGURED') {
             setAzureBackendStatus('not-configured');
           }
 
-          if (normalizedMsg.includes('failed to fetch')) {
+          if (normalizedCode.includes('failed to fetch')) {
             setAzureBackendStatus('unreachable');
           }
 
           setOcrFallbackReason(fallbackReason);
 
-          if (msg === 'RATE_LIMIT') {
+          if (errorCode === 'RATE_LIMIT') {
             setOcrStatusMsg('Rate limit reached, switching to on-device OCR...');
-          } else if (msg === 'AZURE_NOT_CONFIGURED') {
+          } else if (errorCode === 'AZURE_NOT_CONFIGURED') {
             setOcrStatusMsg('Backend not configured, switching to on-device OCR...');
           } else {
             setOcrStatusMsg('Azure unavailable, switching to on-device OCR...');
           }
 
-          console.warn('Azure OCR fallback:', msg);
+          console.warn('Azure OCR fallback:', rawMessage);
           setOcrProgress(0);
         }
       } else {
