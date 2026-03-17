@@ -98,6 +98,8 @@ const appEnv = (import.meta as { env?: AppEnv }).env || {};
 const API_BASE_URL = (appEnv.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
 const GOOGLE_CLIENT_ID = (appEnv.VITE_GOOGLE_CLIENT_ID || '').trim();
 const GOOGLE_DRIVE_FOLDER_ID = (appEnv.VITE_GOOGLE_DRIVE_FOLDER_ID || '').trim();
+const GOOGLE_CLIENT_ID_SETUP_HINT =
+  'Set VITE_GOOGLE_CLIENT_ID in your build environment. For GitHub Pages, add it in Settings > Secrets and variables > Actions, then redeploy.';
 const GOOGLE_OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
   'https://www.googleapis.com/auth/documents',
@@ -764,7 +766,7 @@ export default function App() {
   const handleGoogleSignIn = async () => {
     if (!GOOGLE_CLIENT_ID) {
       setGoogleExportStatus('error');
-      setGoogleExportError('Set VITE_GOOGLE_CLIENT_ID to enable Google Docs export.');
+      setGoogleExportError(GOOGLE_CLIENT_ID_SETUP_HINT);
       return;
     }
 
@@ -808,7 +810,7 @@ export default function App() {
 
     if (!GOOGLE_CLIENT_ID) {
       setGoogleExportStatus('error');
-      setGoogleExportError('Set VITE_GOOGLE_CLIENT_ID to enable Google Docs export.');
+      setGoogleExportError(GOOGLE_CLIENT_ID_SETUP_HINT);
       return;
     }
 
@@ -1077,7 +1079,7 @@ export default function App() {
 
   const googleStatusDetail =
     googleAuthStatus === 'disabled'
-      ? 'Set VITE_GOOGLE_CLIENT_ID to enable Docs export.'
+      ? GOOGLE_CLIENT_ID_SETUP_HINT
       : googleExportStatus === 'authorizing'
       ? 'Waiting for Google OAuth permission...'
       : googleExportStatus === 'creating-doc'

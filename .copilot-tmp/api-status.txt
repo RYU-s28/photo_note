@@ -1,11 +1,11 @@
 [processes]
 
 [ports]
-node        571 codespace   21u  IPv4   31963      0t0  TCP 127.0.0.1:38521 (LISTEN)
-MainThrea 36714 codespace   21u  IPv6 1285511      0t0  TCP *:8787 (LISTEN)
+node       572 codespace   21u  IPv4  37149      0t0  TCP 127.0.0.1:37317 (LISTEN)
+MainThrea 7048 codespace   21u  IPv6 231286      0t0  TCP *:8787 (LISTEN)
 
 [health]
-{"ok":true,"azureConfigured":true,"language":"en","maxImageBytes":10485760}
+{"ok":true,"azureConfigured":true,"endpointValid":true,"language":"en","maxImageBytes":10485760}
 [log tail]
 
 > @figma/my-make-file@0.0.1 dev:api

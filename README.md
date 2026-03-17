@@ -93,7 +93,12 @@ GitHub Pages can host the frontend, but it cannot run the Node/Express API from 
 1. Deploy the API server to a backend host such as Azure App Service, Render, Railway, Fly.io, or another Node runtime.
 2. Set backend env vars there: `VISION_ENDPOINT`, `VISION_KEY`, and optionally `VISION_LANGUAGE`.
 3. Set `CORS_ALLOW_ORIGINS` on the backend to your Pages origin. For a site served from `https://your-user.github.io/photo_note/`, the correct origin is `https://your-user.github.io`.
-4. In your GitHub repository settings, add an Actions variable named `VITE_API_BASE_URL` with your deployed API base URL, for example `https://photo-note-api.onrender.com`.
-5. Push to `main` or rerun the Pages workflow. The frontend build will use that backend URL instead of local `/api` routes.
+4. In your GitHub repository settings, add these **Actions variables**:
+	- `VITE_API_BASE_URL` with your deployed API base URL, for example `https://photo-note-api.onrender.com`
+	- `VITE_GOOGLE_CLIENT_ID` with your Google OAuth Web Client ID
+	- `VITE_GOOGLE_DRIVE_FOLDER_ID` (optional) if you want docs created in a specific Drive folder
+5. In Google Cloud Console, add your Pages origin to authorized JavaScript origins for the same OAuth client:
+	- `https://your-user.github.io`
+6. Push to `main` or rerun the Pages workflow. The frontend build will include the Google client ID and backend URL.
 
 Without a separate backend host, GitHub Pages can only use the local Tesseract fallback because Azure keys must remain server-side.

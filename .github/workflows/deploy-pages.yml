@@ -31,10 +31,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Validate Google Docs export config
+        env:
+          VITE_GOOGLE_CLIENT_ID: ${{ vars.VITE_GOOGLE_CLIENT_ID || secrets.VITE_GOOGLE_CLIENT_ID }}
+        run: |
+          if [ -z "$VITE_GOOGLE_CLIENT_ID" ]; then
+            echo "::warning::VITE_GOOGLE_CLIENT_ID is empty. Google Docs export will be disabled on GitHub Pages."
+          fi
+
       - name: Build
         env:
           VITE_BASE_PATH: /${{ github.event.repository.name }}/
-          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || secrets.VITE_API_BASE_URL }}
+          VITE_GOOGLE_CLIENT_ID: ${{ vars.VITE_GOOGLE_CLIENT_ID || secrets.VITE_GOOGLE_CLIENT_ID }}
+          VITE_GOOGLE_DRIVE_FOLDER_ID: ${{ vars.VITE_GOOGLE_DRIVE_FOLDER_ID || secrets.VITE_GOOGLE_DRIVE_FOLDER_ID }}
         run: npm run build
 
       - name: Add SPA fallback

@@ -10,17 +10,15 @@ node       572 codespace   21u  IPv4  37149      0t0  TCP 127.0.0.1:37317 (LISTE
 > @figma/my-make-file@0.0.1 dev
 > concurrently -k -n API,WEB -c green,cyan "npm run dev:api" "npm run dev:web"
 
-[WEB] 
-[WEB] > @figma/my-make-file@0.0.1 dev:web
-[WEB] > vite --host 0.0.0.0 --port 5173
-[WEB] 
 [API] 
 [API] > @figma/my-make-file@0.0.1 dev:api
 [API] > node server/index.mjs
 [API] 
+[WEB] 
+[WEB] > @figma/my-make-file@0.0.1 dev:web
+[WEB] > vite --host 0.0.0.0 --port 5173
+[WEB] 
 [API] [api] OCR backend listening on http://localhost:8787
-[WEB] 
-[WEB]   VITE v6.3.5  ready in 2220 ms
-[WEB] 
-[WEB]   ➜  Local:   http://localhost:5173/
-[WEB]   ➜  Network: http://10.0.3.38:5173/
+[API] npm run dev:api exited with code 0
+--> Sending SIGTERM to other processes..
+[WEB] npm run dev:web exited with code SIGTERM

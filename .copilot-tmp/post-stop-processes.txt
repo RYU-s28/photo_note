@@ -1,0 +1,2 @@
+   7003 node /workspaces/photo_note/node_modules/.bin/concurrently -k -n API,WEB -c green,cyan npm run dev:api npm run dev:web
+   7040 node /workspaces/photo_note/node_modules/.bin/vite --host 0.0.0.0 --port 5173
