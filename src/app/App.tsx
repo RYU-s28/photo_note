@@ -1452,9 +1452,16 @@ export default function App() {
               >
                 {/* Small preview of original image */}
                 <div className="flex items-center gap-3 bg-[#1c1d23] p-2 pr-4 rounded-2xl border border-white/5 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
-                  <div className="w-12 h-12 rounded-xl overflow-hidden bg-[#0b0b0f] flex-shrink-0">
-                    <img src={imageSrc!} className="w-full h-full object-cover opacity-80" alt="Thumbnail" />
-                  </div>
+                  <button 
+                    onClick={handleReset}
+                    className="w-12 h-12 rounded-xl overflow-hidden bg-[#0b0b0f] flex-shrink-0 hover:opacity-75 transition-opacity cursor-pointer group relative"
+                    title="Click to retake photo"
+                  >
+                    <img src={imageSrc!} className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity" alt="Thumbnail" />
+                    <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/40 backdrop-blur-sm">
+                      <span className="text-white text-[10px] font-medium">Retake</span>
+                    </div>
+                  </button>
                   <div className="flex-1 min-w-0">
                     <p className="text-[#f5f5f7] text-sm font-medium truncate">Extracted Note</p>
                     <p className="text-[#9aa0aa] text-xs truncate">{ocrSourceLabel}</p>
