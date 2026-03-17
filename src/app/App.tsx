@@ -14,6 +14,7 @@ import {
   LogOut,
   FileUp,
   ExternalLink,
+  ChevronDown,
 } from 'lucide-react';
 import Tesseract from 'tesseract.js';
 
@@ -359,6 +360,7 @@ export default function App() {
   const [extractedText, setExtractedText] = useState<string>('');
   const [ocrEngine, setOcrEngine] = useState<OcrEngine | null>(null);
   const [ocrModelPreference, setOcrModelPreference] = useState<OcrModelPreference>('auto');
+  const [isModelSelectorOpen, setIsModelSelectorOpen] = useState(true);
   const [ocrFallbackReason, setOcrFallbackReason] = useState('');
   const [ocrSourceInfo, setOcrSourceInfo] = useState('');
   const [copied, setCopied] = useState(false);
@@ -1465,46 +1467,70 @@ export default function App() {
             </span>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {OCR_MODEL_OPTIONS.map((option) => {
-              const isActive = ocrModelPreference === option.id;
-              const availabilityText = getOcrModelAvailabilityText(option.id);
+          <button
+            type="button"
+            onClick={() => setIsModelSelectorOpen(!isModelSelectorOpen)}
+            className="flex items-center gap-2 text-[#8a919c] hover:text-[#ccc] transition-colors mb-3"
+          >
+            <ChevronDown
+              size={16}
+              className={`transition-transform duration-200 ${isModelSelectorOpen ? 'rotate-0' : '-rotate-90'}`}
+            />
+            <span className="text-xs font-medium">Models</span>
+          </button>
 
-              return (
-                <button
-                  key={option.id}
-                  type="button"
-                  onClick={() => setOcrModelPreference(option.id)}
-                  disabled={status === 'extracting'}
-                  className={`rounded-2xl border px-3.5 py-3 text-left transition-all ${
-                    isActive
-                      ? 'border-[#4da3ff]/50 bg-[#4da3ff]/12 shadow-[0_0_0_1px_rgba(77,163,255,0.08)_inset]'
-                      : 'border-white/8 bg-[#15161b] hover:bg-white/[0.03]'
-                  } ${status === 'extracting' ? 'opacity-60 cursor-not-allowed' : ''}`}
-                >
-                  <div className="flex items-start justify-between gap-3 mb-2">
-                    <span className={`text-sm font-medium ${isActive ? 'text-[#f5f5f7]' : 'text-[#d8dbe1]'}`}>
-                      {option.label}
-                    </span>
-                    <span
-                      className={`inline-flex h-2.5 w-2.5 rounded-full ${
-                        option.id === 'tesseract' ||
-                        option.id === 'auto' ||
-                        (option.id === 'azure-vision' && visionBackendConfigured) ||
-                        (option.id === 'azure-document-intelligence' && documentIntelligenceBackendConfigured)
-                          ? 'bg-emerald-300'
-                          : 'bg-amber-300'
-                      }`}
-                    />
-                  </div>
-                  <p className="text-[11px] leading-relaxed text-[#8a919c] mb-2">{option.description}</p>
-                  <p className={`text-[11px] font-medium ${isActive ? 'text-[#8fc2ff]' : 'text-[#6f7782]'}`}>
-                    {availabilityText}
-                  </p>
-                </button>
-              );
-            })}
-          </div>
+          <AnimatePresence>
+            {isModelSelectorOpen && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                transition={{ duration: 0.2 }}
+                className="overflow-hidden"
+              >
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {OCR_MODEL_OPTIONS.map((option) => {
+                    const isActive = ocrModelPreference === option.id;
+                    const availabilityText = getOcrModelAvailabilityText(option.id);
+
+                    return (
+                      <button
+                        key={option.id}
+                        type="button"
+                        onClick={() => setOcrModelPreference(option.id)}
+                        disabled={status === 'extracting'}
+                        className={`rounded-2xl border px-3.5 py-3 text-left transition-all ${
+                          isActive
+                            ? 'border-[#4da3ff]/50 bg-[#4da3ff]/12 shadow-[0_0_0_1px_rgba(77,163,255,0.08)_inset]'
+                            : 'border-white/8 bg-[#15161b] hover:bg-white/[0.03]'
+                        } ${status === 'extracting' ? 'opacity-60 cursor-not-allowed' : ''}`}
+                      >
+                        <div className="flex items-start justify-between gap-3 mb-2">
+                          <span className={`text-sm font-medium ${isActive ? 'text-[#f5f5f7]' : 'text-[#d8dbe1]'}`}>
+                            {option.label}
+                          </span>
+                          <span
+                            className={`inline-flex h-2.5 w-2.5 rounded-full ${
+                              option.id === 'tesseract' ||
+                              option.id === 'auto' ||
+                              (option.id === 'azure-vision' && visionBackendConfigured) ||
+                              (option.id === 'azure-document-intelligence' && documentIntelligenceBackendConfigured)
+                                ? 'bg-emerald-300'
+                                : 'bg-amber-300'
+                            }`}
+                          />
+                        </div>
+                        <p className="text-[11px] leading-relaxed text-[#8a919c] mb-2">{option.description}</p>
+                        <p className={`text-[11px] font-medium ${isActive ? 'text-[#8fc2ff]' : 'text-[#6f7782]'}`}>
+                          {availabilityText}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
         </div>
 
         {/* Dynamic Content Area */}
