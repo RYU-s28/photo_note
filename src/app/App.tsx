@@ -1332,8 +1332,8 @@ export default function App() {
   const azureBackendStatusDetail =
     azureBackendStatus === 'configured'
       ? API_BASE_URL
-        ? `Using secure OCR backend at ${API_BASE_URL}. Ready: ${availableCloudModels.join(', ')}.`
-        : `Using server-side OCR. Ready: ${availableCloudModels.join(', ')}.`
+        ? `Using OCR backend`
+        : `Using server-side OCR`
       : azureBackendStatus === 'not-configured'
       ? API_BASE_URL
         ? 'Set VISION_* and/or DOCUMENT_INTELLIGENCE_* on the deployed API server and restart it.'
@@ -1458,9 +1458,6 @@ export default function App() {
           <div className="flex items-start justify-between gap-3 mb-3">
             <div className="min-w-0">
               <p className="text-[#f5f5f7] text-sm font-medium truncate">OCR Model</p>
-              <p className="text-[#9aa0aa] text-xs leading-relaxed">
-                Pick how each scan should be processed. Auto keeps the old fallback behavior.
-              </p>
             </div>
             <span className="inline-flex items-center rounded-full border border-[#4da3ff]/25 bg-[#4da3ff]/10 px-2.5 py-1 text-[11px] font-medium text-[#8fc2ff]">
               {selectedOcrModelLabel}
