@@ -7,7 +7,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const workspaceRoot = path.resolve(__dirname, '..');
 
-const AZURE_API_VERSION = '2024-02-01';
+const AZURE_VISION_API_VERSION = '2024-02-01';
+const DOCUMENT_INTELLIGENCE_API_VERSION = '2024-11-30';
+const LEGACY_DOCUMENT_INTELLIGENCE_API_VERSION = '2023-07-31';
 const DEFAULT_PORT = 8787;
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30000;
@@ -101,6 +103,22 @@ const getConfig = () => {
     ),
     language:
       firstNonEmptyEnv('VISION_LANGUAGE', 'VITE_AZURE_VISION_LANGUAGE') || 'en',
+    documentIntelligenceEndpoint: firstNonEmptyEnv(
+      'DOCUMENT_INTELLIGENCE_ENDPOINT',
+      'AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT',
+      'FORM_RECOGNIZER_ENDPOINT'
+    ),
+    documentIntelligenceKey: firstNonEmptyEnv(
+      'DOCUMENT_INTELLIGENCE_KEY',
+      'AZURE_DOCUMENT_INTELLIGENCE_KEY',
+      'FORM_RECOGNIZER_KEY'
+    ),
+    documentIntelligenceModel:
+      firstNonEmptyEnv(
+        'DOCUMENT_INTELLIGENCE_MODEL',
+        'AZURE_DOCUMENT_INTELLIGENCE_MODEL',
+        'FORM_RECOGNIZER_MODEL'
+      ) || 'prebuilt-read',
     port: parseEnvNumber(process.env.API_PORT || process.env.PORT, DEFAULT_PORT),
     maxImageBytes: parseEnvNumber(process.env.MAX_IMAGE_BYTES, DEFAULT_MAX_IMAGE_BYTES),
     timeoutMs: parseEnvNumber(process.env.AZURE_REQUEST_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
@@ -171,6 +189,37 @@ const extractLegacyReadText = payload => {
     .join('\n');
 };
 
+const extractDocumentIntelligenceText = payload => {
+  if (
+    payload?.analyzeResult &&
+    typeof payload.analyzeResult.content === 'string' &&
+    payload.analyzeResult.content.trim()
+  ) {
+    return payload.analyzeResult.content.trim();
+  }
+
+  const pages = payload?.analyzeResult?.pages;
+  if (!Array.isArray(pages)) {
+    return '';
+  }
+
+  const lines = pages.flatMap(page => (Array.isArray(page?.lines) ? page.lines : []));
+  return lines
+    .map(line => {
+      if (typeof line?.content === 'string') {
+        return line.content.trim();
+      }
+
+      if (typeof line?.text === 'string') {
+        return line.text.trim();
+      }
+
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+};
+
 const toErrorString = payload => {
   if (!payload) {
     return '';
@@ -193,7 +242,7 @@ const buildAzureHeaders = (key, contentType) => ({
 });
 
 const callImageAnalysisRead = async ({ endpoint, key, language, imageBuffer, contentType, timeoutMs }) => {
-  const imageAnalysisUrl = `${normalizeEndpoint(endpoint)}/computervision/imageanalysis:analyze?api-version=${AZURE_API_VERSION}&features=read&language=${encodeURIComponent(language)}`;
+  const imageAnalysisUrl = `${normalizeEndpoint(endpoint)}/computervision/imageanalysis:analyze?api-version=${AZURE_VISION_API_VERSION}&features=read&language=${encodeURIComponent(language)}`;
 
   const response = await fetchWithTimeout(
     imageAnalysisUrl,
@@ -302,6 +351,132 @@ const callLegacyRead = async ({
   };
 };
 
+const callDocumentIntelligenceReadAtUrl = async ({
+  analyzeUrl,
+  key,
+  imageBuffer,
+  contentType,
+  timeoutMs,
+  pollIntervalMs,
+  maxPollAttempts,
+}) => {
+  const analyzeResponse = await fetchWithTimeout(
+    analyzeUrl,
+    {
+      method: 'POST',
+      headers: buildAzureHeaders(key, contentType),
+      body: imageBuffer,
+    },
+    timeoutMs
+  );
+
+  if (!analyzeResponse.ok) {
+    return {
+      ok: false,
+      status: analyzeResponse.status,
+      payload: await readResponseBody(analyzeResponse),
+    };
+  }
+
+  const operationLocation = analyzeResponse.headers.get('operation-location');
+  if (!operationLocation) {
+    return {
+      ok: false,
+      status: 502,
+      payload: { error: 'Document Intelligence response did not include operation-location.' },
+    };
+  }
+
+  for (let attempt = 0; attempt < maxPollAttempts; attempt += 1) {
+    await sleep(pollIntervalMs);
+
+    const statusResponse = await fetchWithTimeout(
+      operationLocation,
+      {
+        method: 'GET',
+        headers: {
+          'Ocp-Apim-Subscription-Key': key,
+        },
+      },
+      timeoutMs
+    );
+
+    const statusPayload = await readResponseBody(statusResponse);
+
+    if (!statusResponse.ok) {
+      return {
+        ok: false,
+        status: statusResponse.status,
+        payload: statusPayload,
+      };
+    }
+
+    const statusValue = String(statusPayload?.status || '').toLowerCase();
+
+    if (statusValue === 'succeeded') {
+      return {
+        ok: true,
+        status: 200,
+        payload: statusPayload,
+      };
+    }
+
+    if (statusValue === 'failed') {
+      return {
+        ok: false,
+        status: 502,
+        payload: { error: 'Document Intelligence failed while processing the image.' },
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    status: 504,
+    payload: { error: 'Document Intelligence timed out while waiting for the result.' },
+  };
+};
+
+const callDocumentIntelligenceRead = async ({
+  endpoint,
+  key,
+  modelId,
+  imageBuffer,
+  contentType,
+  timeoutMs,
+  pollIntervalMs,
+  maxPollAttempts,
+}) => {
+  const normalizedEndpoint = normalizeEndpoint(endpoint);
+  const encodedModelId = encodeURIComponent(modelId);
+  const primaryUrl = `${normalizedEndpoint}/documentintelligence/documentModels/${encodedModelId}:analyze?api-version=${DOCUMENT_INTELLIGENCE_API_VERSION}`;
+
+  const primaryResult = await callDocumentIntelligenceReadAtUrl({
+    analyzeUrl: primaryUrl,
+    key,
+    imageBuffer,
+    contentType,
+    timeoutMs,
+    pollIntervalMs,
+    maxPollAttempts,
+  });
+
+  if (primaryResult.ok || primaryResult.status !== 404) {
+    return primaryResult;
+  }
+
+  const legacyUrl = `${normalizedEndpoint}/formrecognizer/documentModels/${encodedModelId}:analyze?api-version=${LEGACY_DOCUMENT_INTELLIGENCE_API_VERSION}`;
+  return callDocumentIntelligenceReadAtUrl({
+    analyzeUrl: legacyUrl,
+    key,
+    imageBuffer,
+    contentType,
+    timeoutMs,
+    pollIntervalMs,
+    maxPollAttempts,
+  });
+};
+
 const mapAzureError = (status, payload) => {
   if (status === 429) {
     return {
@@ -352,8 +527,109 @@ const mapAzureError = (status, payload) => {
   };
 };
 
+const mapDocumentIntelligenceError = (status, payload) => {
+  if (status === 429) {
+    return {
+      status: 429,
+      code: 'RATE_LIMIT',
+      error: 'Azure Document Intelligence rate limit reached.',
+    };
+  }
+
+  if (status === 401 || status === 403) {
+    return {
+      status: 503,
+      code: 'DOCUMENT_INTELLIGENCE_AUTH_FAILED',
+      error: 'Azure Document Intelligence authentication failed. Check DOCUMENT_INTELLIGENCE_KEY.',
+    };
+  }
+
+  if (status === 404) {
+    return {
+      status: 503,
+      code: 'DOCUMENT_INTELLIGENCE_ENDPOINT_UNAVAILABLE',
+      error: 'Azure Document Intelligence endpoint path is not available for this resource.',
+    };
+  }
+
+  if (status === 400) {
+    return {
+      status: 400,
+      code: 'DOCUMENT_INTELLIGENCE_BAD_REQUEST',
+      error: 'Azure Document Intelligence rejected the image request.',
+      details: toErrorString(payload),
+    };
+  }
+
+  if (status === 504) {
+    return {
+      status: 504,
+      code: 'REQUEST_TIMEOUT',
+      error: 'Azure Document Intelligence timed out.',
+    };
+  }
+
+  return {
+    status: 502,
+    code: 'DOCUMENT_INTELLIGENCE_REQUEST_FAILED',
+    error: 'Azure Document Intelligence request failed.',
+    details: toErrorString(payload),
+  };
+};
+
+const validateImageRequest = (req, maxImageBytes) => {
+  const contentType = String(req.headers['content-type'] || '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
+
+  const allowedContentType = contentType.startsWith('image/') || contentType === 'application/octet-stream';
+
+  if (!allowedContentType) {
+    return {
+      ok: false,
+      status: 415,
+      payload: {
+        error: 'Unsupported content type. Send an image binary body.',
+        code: 'UNSUPPORTED_MEDIA_TYPE',
+      },
+    };
+  }
+
+  if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      payload: {
+        error: 'Request body must contain image binary data.',
+        code: 'INVALID_IMAGE_BODY',
+      },
+    };
+  }
+
+  if (req.body.length > maxImageBytes) {
+    return {
+      ok: false,
+      status: 413,
+      payload: {
+        error: `Image is too large. Max bytes: ${maxImageBytes}.`,
+        code: 'IMAGE_TOO_LARGE',
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    contentType,
+  };
+};
+
 const app = express();
 const startupConfig = getConfig();
+const rawImageBodyParser = express.raw({
+  type: ['image/*', 'application/octet-stream'],
+  limit: `${startupConfig.maxImageBytes}b`,
+});
 
 app.use((req, res, next) => {
   const { allowedOrigins } = getConfig();
@@ -401,23 +677,27 @@ app.use((req, res, next) => {
 
 app.get('/api/ocr/health', (_req, res) => {
   const config = getConfig();
-  const configured = Boolean(config.endpoint && config.key);
+  const visionConfigured = Boolean(config.endpoint && config.key);
+  const documentIntelligenceConfigured = Boolean(
+    config.documentIntelligenceEndpoint && config.documentIntelligenceKey
+  );
 
   res.json({
     ok: true,
-    azureConfigured: configured,
-    endpointValid: !config.endpoint || isValidHttpUrl(config.endpoint),
+    azureConfigured: visionConfigured || documentIntelligenceConfigured,
+    visionConfigured,
+    visionEndpointValid: !config.endpoint || isValidHttpUrl(config.endpoint),
+    documentIntelligenceConfigured,
+    documentIntelligenceEndpointValid:
+      !config.documentIntelligenceEndpoint || isValidHttpUrl(config.documentIntelligenceEndpoint),
     language: config.language,
     maxImageBytes: config.maxImageBytes,
   });
 });
 
 app.post(
-  '/api/ocr/azure',
-  express.raw({
-    type: ['image/*', 'application/octet-stream'],
-    limit: `${startupConfig.maxImageBytes}b`,
-  }),
+  ['/api/ocr/azure', '/api/ocr/azure-vision'],
+  rawImageBodyParser,
   async (req, res) => {
     const config = getConfig();
     const azureConfigured = Boolean(config.endpoint && config.key);
@@ -438,36 +718,13 @@ app.post(
       return;
     }
 
-    const contentType = String(req.headers['content-type'] || '')
-      .split(';')[0]
-      .trim()
-      .toLowerCase();
-
-    const allowedContentType = contentType.startsWith('image/') || contentType === 'application/octet-stream';
-
-    if (!allowedContentType) {
-      res.status(415).json({
-        error: 'Unsupported content type. Send an image binary body.',
-        code: 'UNSUPPORTED_MEDIA_TYPE',
-      });
+    const imageValidation = validateImageRequest(req, config.maxImageBytes);
+    if (!imageValidation.ok) {
+      res.status(imageValidation.status).json(imageValidation.payload);
       return;
     }
 
-    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
-      res.status(400).json({
-        error: 'Request body must contain image binary data.',
-        code: 'INVALID_IMAGE_BODY',
-      });
-      return;
-    }
-
-    if (req.body.length > config.maxImageBytes) {
-      res.status(413).json({
-        error: `Image is too large. Max bytes: ${config.maxImageBytes}.`,
-        code: 'IMAGE_TOO_LARGE',
-      });
-      return;
-    }
+    const { contentType } = imageValidation;
 
     try {
       const imageAnalysisResult = await callImageAnalysisRead({
@@ -542,6 +799,90 @@ app.post(
     }
   }
 );
+
+app.post('/api/ocr/document-intelligence', rawImageBodyParser, async (req, res) => {
+  const config = getConfig();
+  const documentIntelligenceConfigured = Boolean(
+    config.documentIntelligenceEndpoint && config.documentIntelligenceKey
+  );
+
+  if (!documentIntelligenceConfigured) {
+    res.status(503).json({
+      error: 'Azure Document Intelligence backend is not configured.',
+      code: 'DOCUMENT_INTELLIGENCE_NOT_CONFIGURED',
+    });
+    return;
+  }
+
+  if (!isValidHttpUrl(config.documentIntelligenceEndpoint)) {
+    res.status(503).json({
+      error:
+        'Azure Document Intelligence endpoint is invalid. Use full https://<resource>.cognitiveservices.azure.com URL.',
+      code: 'DOCUMENT_INTELLIGENCE_ENDPOINT_INVALID',
+    });
+    return;
+  }
+
+  const imageValidation = validateImageRequest(req, config.maxImageBytes);
+  if (!imageValidation.ok) {
+    res.status(imageValidation.status).json(imageValidation.payload);
+    return;
+  }
+
+  const { contentType } = imageValidation;
+
+  try {
+    const documentIntelligenceResult = await callDocumentIntelligenceRead({
+      endpoint: config.documentIntelligenceEndpoint,
+      key: config.documentIntelligenceKey,
+      modelId: config.documentIntelligenceModel,
+      imageBuffer: req.body,
+      contentType,
+      timeoutMs: config.timeoutMs,
+      pollIntervalMs: config.pollIntervalMs,
+      maxPollAttempts: config.maxPollAttempts,
+    });
+
+    if (documentIntelligenceResult.ok) {
+      res.json({
+        text:
+          extractDocumentIntelligenceText(documentIntelligenceResult.payload) ||
+          'No text was found in the image.',
+        source: 'azure-document-intelligence',
+        modelVersion:
+          typeof documentIntelligenceResult.payload?.modelId === 'string'
+            ? documentIntelligenceResult.payload.modelId
+            : config.documentIntelligenceModel,
+      });
+      return;
+    }
+
+    const mappedError = mapDocumentIntelligenceError(
+      documentIntelligenceResult.status,
+      documentIntelligenceResult.payload
+    );
+    res.status(mappedError.status).json(mappedError);
+  } catch (error) {
+    if (error instanceof Error && error.message === 'REQUEST_TIMEOUT') {
+      const mappedTimeoutError = mapDocumentIntelligenceError(504, { error: error.message });
+      res.status(mappedTimeoutError.status).json(mappedTimeoutError);
+      return;
+    }
+
+    const errorDetails =
+      error instanceof Error && typeof error.message === 'string' && error.message.trim()
+        ? error.message.trim()
+        : 'Unknown error';
+
+    console.error('[api] Azure Document Intelligence request failed:', errorDetails);
+
+    res.status(502).json({
+      error: 'Azure Document Intelligence request failed.',
+      code: 'DOCUMENT_INTELLIGENCE_REQUEST_FAILED',
+      details: errorDetails,
+    });
+  }
+});
 
 app.use((error, _req, res, _next) => {
   if (error?.type === 'entity.too.large') {

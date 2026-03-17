@@ -11,5 +11,11 @@ services:
         sync: false
       - key: VISION_LANGUAGE
         value: en
+      - key: DOCUMENT_INTELLIGENCE_ENDPOINT
+        sync: false
+      - key: DOCUMENT_INTELLIGENCE_KEY
+        sync: false
+      - key: DOCUMENT_INTELLIGENCE_MODEL
+        value: prebuilt-read
       - key: CORS_ALLOW_ORIGINS
         sync: false

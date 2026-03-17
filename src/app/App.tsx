@@ -19,7 +19,9 @@ import Tesseract from 'tesseract.js';
 
 type AppState = 'idle' | 'ready' | 'extracting' | 'done';
 
-type OcrEngine = 'azure' | 'tesseract';
+type OcrEngine = 'azure-vision' | 'azure-document-intelligence' | 'tesseract';
+
+type OcrModelPreference = 'auto' | OcrEngine;
 
 type AzureBackendOcrResponse = {
   text?: string;
@@ -32,6 +34,10 @@ type AzureBackendOcrResponse = {
 
 type AzureBackendHealthResponse = {
   azureConfigured?: boolean;
+  visionConfigured?: boolean;
+  documentIntelligenceConfigured?: boolean;
+  visionEndpointValid?: boolean;
+  documentIntelligenceEndpointValid?: boolean;
 };
 
 type AzureBackendStatus = 'checking' | 'configured' | 'not-configured' | 'unreachable';
@@ -105,9 +111,50 @@ const GOOGLE_OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/documents',
 ].join(' ');
 const GOOGLE_IDENTITY_SCRIPT_SRC = 'https://accounts.google.com/gsi/client';
+const OCR_MODEL_OPTIONS: Array<{
+  id: OcrModelPreference;
+  label: string;
+  description: string;
+}> = [
+  {
+    id: 'auto',
+    label: 'Auto',
+    description: 'Try AI Vision, then Document Intelligence, then on-device OCR.',
+  },
+  {
+    id: 'azure-vision',
+    label: 'AI Vision',
+    description: 'Fast Azure OCR for photos, screenshots, and mixed scenes.',
+  },
+  {
+    id: 'azure-document-intelligence',
+    label: 'Document Intelligence',
+    description: 'Azure document-focused OCR for dense notes and structured pages.',
+  },
+  {
+    id: 'tesseract',
+    label: 'Tesseract',
+    description: 'On-device OCR with no backend dependency.',
+  },
+];
 
 const clampZoom = (zoomValue: number) => Math.min(MAX_CAMERA_ZOOM, Math.max(MIN_CAMERA_ZOOM, zoomValue));
 const getApiUrl = (path: string) => `${API_BASE_URL}${path}`;
+
+const getOcrModelLabel = (model: OcrModelPreference | OcrEngine) => {
+  switch (model) {
+    case 'auto':
+      return 'Auto';
+    case 'azure-vision':
+      return 'Azure AI Vision';
+    case 'azure-document-intelligence':
+      return 'Azure Document Intelligence';
+    case 'tesseract':
+      return 'Tesseract';
+    default:
+      return 'OCR';
+  }
+};
 
 const getTouchDistance = (touches: React.TouchList) => {
   const [firstTouch, secondTouch] = [touches[0], touches[1]];
@@ -116,43 +163,62 @@ const getTouchDistance = (touches: React.TouchList) => {
   return Math.hypot(deltaX, deltaY);
 };
 
-const toAzureFallbackReason = (errorMessage: string) => {
+const toRemoteOcrFailureReason = (
+  model: 'azure-vision' | 'azure-document-intelligence',
+  errorMessage: string
+) => {
+  const serviceLabel = getOcrModelLabel(model);
+  const missingConfigMessage =
+    model === 'azure-document-intelligence'
+      ? 'Backend is missing DOCUMENT_INTELLIGENCE_ENDPOINT or DOCUMENT_INTELLIGENCE_KEY.'
+      : 'Backend is missing VISION_ENDPOINT or VISION_KEY.';
+  const invalidEndpointMessage =
+    model === 'azure-document-intelligence'
+      ? 'Backend DOCUMENT_INTELLIGENCE_ENDPOINT is invalid.'
+      : 'Backend VISION_ENDPOINT is invalid.';
+
   if (!errorMessage) {
-    return 'Azure OCR request failed.';
+    return `${serviceLabel} request failed.`;
   }
 
   const normalizedMessage = errorMessage.toLowerCase();
 
   if (errorMessage === 'RATE_LIMIT') {
-    return 'Azure rate limit reached.';
+    return `${serviceLabel} rate limit reached.`;
   }
 
-  if (errorMessage === 'AZURE_NOT_CONFIGURED') {
-    return 'Backend is missing VISION_ENDPOINT or VISION_KEY.';
+  if (errorMessage === 'AZURE_NOT_CONFIGURED' || errorMessage === 'DOCUMENT_INTELLIGENCE_NOT_CONFIGURED') {
+    return missingConfigMessage;
   }
 
-  if (errorMessage === 'AZURE_AUTH_FAILED') {
-    return 'Backend Azure key is invalid.';
+  if (errorMessage === 'AZURE_AUTH_FAILED' || errorMessage === 'DOCUMENT_INTELLIGENCE_AUTH_FAILED') {
+    return `${serviceLabel} credentials are invalid.`;
   }
 
-  if (errorMessage === 'AZURE_ENDPOINT_UNAVAILABLE') {
-    return 'Azure endpoint path is not available for this resource.';
+  if (
+    errorMessage === 'AZURE_ENDPOINT_UNAVAILABLE' ||
+    errorMessage === 'DOCUMENT_INTELLIGENCE_ENDPOINT_UNAVAILABLE'
+  ) {
+    return `${serviceLabel} endpoint path is not available for this resource.`;
   }
 
-  if (errorMessage === 'AZURE_ENDPOINT_INVALID') {
-    return 'Backend VISION_ENDPOINT is invalid.';
+  if (errorMessage === 'AZURE_ENDPOINT_INVALID' || errorMessage === 'DOCUMENT_INTELLIGENCE_ENDPOINT_INVALID') {
+    return invalidEndpointMessage;
   }
 
-  if (errorMessage === 'AZURE_BAD_REQUEST') {
-    return 'Azure rejected this image request.';
+  if (errorMessage === 'AZURE_BAD_REQUEST' || errorMessage === 'DOCUMENT_INTELLIGENCE_BAD_REQUEST') {
+    return `${serviceLabel} rejected this image request.`;
   }
 
-  if (errorMessage === 'AZURE_REQUEST_FAILED') {
-    return 'Azure OCR request failed on the backend.';
+  if (
+    errorMessage === 'AZURE_REQUEST_FAILED' ||
+    errorMessage === 'DOCUMENT_INTELLIGENCE_REQUEST_FAILED'
+  ) {
+    return `${serviceLabel} request failed on the backend.`;
   }
 
   if (errorMessage === 'REQUEST_TIMEOUT') {
-    return 'Azure OCR timed out.';
+    return `${serviceLabel} timed out.`;
   }
 
   if (errorMessage === 'IMAGE_TOO_LARGE') {
@@ -168,10 +234,22 @@ const toAzureFallbackReason = (errorMessage: string) => {
   }
 
   if (normalizedMessage.includes('timeout')) {
-    return 'Azure OCR timed out.';
+    return `${serviceLabel} timed out.`;
   }
 
-  return 'Azure OCR request failed.';
+  return `${serviceLabel} request failed.`;
+};
+
+const describeRemoteOcrSource = (payload: AzureBackendOcrResponse) => {
+  if (payload.source === 'azure-read-v3.2') {
+    return 'Using legacy Azure Read v3.2 fallback.';
+  }
+
+  if (payload.modelVersion) {
+    return `Model: ${payload.modelVersion}`;
+  }
+
+  return '';
 };
 
 const normalizeExtractedText = (text: string) => {
@@ -280,9 +358,13 @@ export default function App() {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [extractedText, setExtractedText] = useState<string>('');
   const [ocrEngine, setOcrEngine] = useState<OcrEngine | null>(null);
+  const [ocrModelPreference, setOcrModelPreference] = useState<OcrModelPreference>('auto');
   const [ocrFallbackReason, setOcrFallbackReason] = useState('');
+  const [ocrSourceInfo, setOcrSourceInfo] = useState('');
   const [copied, setCopied] = useState(false);
   const [azureBackendStatus, setAzureBackendStatus] = useState<AzureBackendStatus>('checking');
+  const [visionBackendConfigured, setVisionBackendConfigured] = useState(false);
+  const [documentIntelligenceBackendConfigured, setDocumentIntelligenceBackendConfigured] = useState(false);
   
   // OCR State
   const [ocrStatusMsg, setOcrStatusMsg] = useState<string>('Initializing OCR...');
@@ -463,6 +545,7 @@ export default function App() {
       setExtractedText('');
       setOcrEngine(null);
       setOcrFallbackReason('');
+      setOcrSourceInfo('');
       setOcrProgress(0);
       setCopied(false);
       resetGoogleExportFeedback();
@@ -565,11 +648,18 @@ export default function App() {
 
         const payload = (await response.json()) as AzureBackendHealthResponse;
         if (!isCancelled) {
-          setAzureBackendStatus(payload.azureConfigured ? 'configured' : 'not-configured');
+          const hasVision = Boolean(payload.visionConfigured);
+          const hasDocumentIntelligence = Boolean(payload.documentIntelligenceConfigured);
+
+          setVisionBackendConfigured(hasVision);
+          setDocumentIntelligenceBackendConfigured(hasDocumentIntelligence);
+          setAzureBackendStatus(hasVision || hasDocumentIntelligence ? 'configured' : 'not-configured');
         }
       } catch {
         if (!isCancelled) {
           setAzureBackendStatus('unreachable');
+          setVisionBackendConfigured(false);
+          setDocumentIntelligenceBackendConfigured(false);
         }
       }
     };
@@ -970,12 +1060,17 @@ export default function App() {
     return result.data.text || 'No text was found in the image.';
   };
 
-  const runAzureVisionOCR = async (sourceImage: string) => {
-    setOcrStatusMsg('Uploading image to secure OCR backend...');
+  const runRemoteOcr = async (
+    sourceImage: string,
+    path: string,
+    uploadMessage: string,
+    processingMessage: string
+  ) => {
+    setOcrStatusMsg(uploadMessage);
     setOcrProgress(10);
 
     const imageBlob = await fetch(sourceImage).then(res => res.blob());
-    const response = await fetch(getApiUrl('/api/ocr/azure'), {
+    const response = await fetch(getApiUrl(path), {
       method: 'POST',
       headers: {
         'Content-Type': imageBlob.type || 'application/octet-stream',
@@ -1007,15 +1102,32 @@ export default function App() {
       throw new Error(errorCode);
     }
 
-    setOcrStatusMsg('Azure is reading text...');
+    setOcrStatusMsg(processingMessage);
     setOcrProgress(85);
 
     const payload = (await response.json()) as AzureBackendOcrResponse;
     setOcrProgress(100);
-    return payload.text || 'No text was found in the image.';
+    return payload;
   };
 
-  // Extract text using Azure AI Vision first, then fallback to on-device OCR when needed
+  const runAzureVisionOCR = async (sourceImage: string) => {
+    return runRemoteOcr(
+      sourceImage,
+      '/api/ocr/azure',
+      'Uploading image to Azure AI Vision...',
+      'Azure AI Vision is reading text...'
+    );
+  };
+
+  const runAzureDocumentIntelligenceOCR = async (sourceImage: string) => {
+    return runRemoteOcr(
+      sourceImage,
+      '/api/ocr/document-intelligence',
+      'Uploading image to Azure Document Intelligence...',
+      'Azure Document Intelligence is analyzing text...'
+    );
+  };
+
   const handleExtract = async () => {
     if (!imageSrc) return;
     const sourceImage = imageSrc;
@@ -1023,54 +1135,139 @@ export default function App() {
     setStatus('extracting');
     setOcrEngine(null);
     setOcrFallbackReason('');
+    setOcrSourceInfo('');
     setOcrStatusMsg('Preparing image...');
     setOcrProgress(0);
     resetGoogleExportFeedback();
     
     try {
-      if (navigator.onLine) {
-        try {
-          const azureText = await runAzureVisionOCR(sourceImage);
-          setExtractedText(azureText);
-          setOcrEngine('azure');
-          setOcrFallbackReason('');
-          setAzureBackendStatus('configured');
-          setStatus('done');
-          return;
-        } catch (azureError: unknown) {
-          const rawMessage = azureError instanceof Error ? azureError.message : '';
-          const [errorCode, errorDetails] = rawMessage.split('::', 2);
-          const normalizedCode = errorCode.toLowerCase();
-          const fallbackReasonBase = toAzureFallbackReason(errorCode);
-          const fallbackReason = errorDetails
-            ? `${fallbackReasonBase} Details: ${errorDetails}`
-            : fallbackReasonBase;
+      const completeRemoteExtract = (
+        model: 'azure-vision' | 'azure-document-intelligence',
+        payload: AzureBackendOcrResponse
+      ) => {
+        setExtractedText(payload.text || 'No text was found in the image.');
+        setOcrEngine(model);
+        setOcrSourceInfo(describeRemoteOcrSource(payload));
+        setOcrFallbackReason('');
+        setAzureBackendStatus('configured');
+        setStatus('done');
+      };
 
-          if (errorCode === 'AZURE_NOT_CONFIGURED') {
+      const runSelectedRemoteModel = async (model: 'azure-vision' | 'azure-document-intelligence') => {
+        const payload =
+          model === 'azure-document-intelligence'
+            ? await runAzureDocumentIntelligenceOCR(sourceImage)
+            : await runAzureVisionOCR(sourceImage);
+
+        completeRemoteExtract(model, payload);
+      };
+
+      const syncRemoteStatusFromFailure = (
+        model: 'azure-vision' | 'azure-document-intelligence',
+        errorCode: string,
+        rawMessage: string
+      ) => {
+        const normalizedCode = errorCode.toLowerCase();
+
+        if (model === 'azure-vision' && errorCode === 'AZURE_NOT_CONFIGURED') {
+          setVisionBackendConfigured(false);
+          if (!documentIntelligenceBackendConfigured) {
             setAzureBackendStatus('not-configured');
           }
+        }
 
-          if (normalizedCode.includes('failed to fetch')) {
-            setAzureBackendStatus('unreachable');
+        if (
+          model === 'azure-document-intelligence' &&
+          errorCode === 'DOCUMENT_INTELLIGENCE_NOT_CONFIGURED'
+        ) {
+          setDocumentIntelligenceBackendConfigured(false);
+          if (!visionBackendConfigured) {
+            setAzureBackendStatus('not-configured');
           }
+        }
 
-          setOcrFallbackReason(fallbackReason);
+        if (normalizedCode.includes('failed to fetch') || rawMessage.toLowerCase().includes('failed to fetch')) {
+          setAzureBackendStatus('unreachable');
+        }
+      };
 
-          if (errorCode === 'RATE_LIMIT') {
-            setOcrStatusMsg('Rate limit reached, switching to on-device OCR...');
-          } else if (errorCode === 'AZURE_NOT_CONFIGURED') {
-            setOcrStatusMsg('Backend not configured, switching to on-device OCR...');
-          } else {
-            setOcrStatusMsg('Azure unavailable, switching to on-device OCR...');
-          }
+      const extractFailureReason = (
+        model: 'azure-vision' | 'azure-document-intelligence',
+        rawMessage: string
+      ) => {
+        const [errorCode, errorDetails] = rawMessage.split('::', 2);
+        const baseReason = toRemoteOcrFailureReason(model, errorCode || rawMessage);
+        return errorDetails ? `${baseReason} Details: ${errorDetails}` : baseReason;
+      };
 
-          console.warn('Azure OCR fallback:', rawMessage);
+      if (ocrModelPreference === 'tesseract') {
+        setOcrStatusMsg('Running on-device OCR...');
+        const localText = await runTesseractOCR(sourceImage);
+        setExtractedText(localText);
+        setOcrEngine('tesseract');
+        setStatus('done');
+        return;
+      }
+
+      if (!navigator.onLine) {
+        if (ocrModelPreference === 'auto') {
+          setOcrFallbackReason('Device is offline.');
+          setOcrStatusMsg('Offline mode: running on-device OCR...');
+          const localText = await runTesseractOCR(sourceImage);
+          setExtractedText(localText);
+          setOcrEngine('tesseract');
+          setStatus('done');
+          return;
+        }
+
+        throw new Error(`${getOcrModelLabel(ocrModelPreference)} requires an internet connection.`);
+      }
+
+      if (
+        ocrModelPreference === 'azure-vision' ||
+        ocrModelPreference === 'azure-document-intelligence'
+      ) {
+        try {
+          await runSelectedRemoteModel(ocrModelPreference);
+          return;
+        } catch (remoteError: unknown) {
+          const rawMessage = remoteError instanceof Error ? remoteError.message : 'Unknown OCR error.';
+          const [errorCode] = rawMessage.split('::', 2);
+          syncRemoteStatusFromFailure(ocrModelPreference, errorCode || rawMessage, rawMessage);
+
+          setExtractedText(
+            'Could not extract text with the selected OCR model. Choose another model and try again.'
+          );
+          setOcrEngine(null);
+          setOcrFallbackReason(extractFailureReason(ocrModelPreference, rawMessage));
+          setStatus('done');
+          return;
+        }
+      }
+
+      const autoCloudModels: Array<'azure-vision' | 'azure-document-intelligence'> = [
+        'azure-vision',
+        'azure-document-intelligence',
+      ];
+      let fallbackReason = 'Cloud OCR models are unavailable.';
+
+      for (const model of autoCloudModels) {
+        try {
+          await runSelectedRemoteModel(model);
+          return;
+        } catch (remoteError: unknown) {
+          const rawMessage = remoteError instanceof Error ? remoteError.message : 'Unknown OCR error.';
+          const [errorCode] = rawMessage.split('::', 2);
+
+          syncRemoteStatusFromFailure(model, errorCode || rawMessage, rawMessage);
+          fallbackReason = extractFailureReason(model, rawMessage);
+          console.warn(`${getOcrModelLabel(model)} fallback:`, rawMessage);
           setOcrProgress(0);
         }
-      } else {
-        setOcrFallbackReason('Device is offline.');
-        setOcrStatusMsg('Offline mode: running on-device OCR...');
       }
+
+      setOcrFallbackReason(fallbackReason);
+      setOcrStatusMsg('Cloud OCR unavailable, switching to on-device OCR...');
 
       const localText = await runTesseractOCR(sourceImage);
       setExtractedText(localText);
@@ -1080,7 +1277,7 @@ export default function App() {
       console.error("OCR Error:", error);
       setExtractedText("Error extracting text. Please try again.");
       setOcrEngine(null);
-      setOcrFallbackReason('OCR failed.');
+      setOcrFallbackReason(error instanceof Error ? error.message : 'OCR failed.');
       setStatus('done');
     }
   };
@@ -1097,6 +1294,7 @@ export default function App() {
     setExtractedText('');
     setOcrEngine(null);
     setOcrFallbackReason('');
+    setOcrSourceInfo('');
     setOcrProgress(0);
     setCameraZoom(1);
     resetGoogleExportFeedback();
@@ -1106,30 +1304,38 @@ export default function App() {
   };
 
   const ocrSourceLabel =
-    ocrEngine === 'azure'
+    ocrEngine === 'azure-vision'
       ? 'Source: Azure AI Vision'
+      : ocrEngine === 'azure-document-intelligence'
+      ? 'Source: Azure Document Intelligence'
       : ocrEngine === 'tesseract'
       ? 'Source: Tesseract (on-device)'
       : 'Source: unavailable';
 
+  const selectedOcrModelLabel = getOcrModelLabel(ocrModelPreference);
+  const availableCloudModels = [
+    visionBackendConfigured ? 'Azure AI Vision' : null,
+    documentIntelligenceBackendConfigured ? 'Azure Document Intelligence' : null,
+  ].filter(Boolean) as string[];
+
   const azureBackendStatusLabel =
     azureBackendStatus === 'configured'
-      ? 'Azure OCR backend: configured'
+      ? 'Cloud OCR backend: ready'
       : azureBackendStatus === 'not-configured'
-      ? 'Azure OCR backend: missing server env'
+      ? 'Cloud OCR backend: setup needed'
       : azureBackendStatus === 'unreachable'
-      ? 'Azure OCR backend: unavailable'
-      : 'Azure OCR backend: checking...';
+      ? 'Cloud OCR backend: unavailable'
+      : 'Cloud OCR backend: checking...';
 
   const azureBackendStatusDetail =
     azureBackendStatus === 'configured'
       ? API_BASE_URL
-        ? `Using secure OCR backend at ${API_BASE_URL}.`
-        : 'Using server-side VISION_ENDPOINT and VISION_KEY.'
+        ? `Using secure OCR backend at ${API_BASE_URL}. Ready: ${availableCloudModels.join(', ')}.`
+        : `Using server-side OCR. Ready: ${availableCloudModels.join(', ')}.`
       : azureBackendStatus === 'not-configured'
       ? API_BASE_URL
-        ? 'Set VISION_ENDPOINT and VISION_KEY on the deployed API server and restart it.'
-        : 'Set VISION_ENDPOINT and VISION_KEY in .env and restart API server.'
+        ? 'Set VISION_* and/or DOCUMENT_INTELLIGENCE_* on the deployed API server and restart it.'
+        : 'Set VISION_* and/or DOCUMENT_INTELLIGENCE_* in .env and restart the API server.'
       : azureBackendStatus === 'unreachable'
       ? API_BASE_URL
         ? `Configured backend ${API_BASE_URL} is unreachable.`
@@ -1143,9 +1349,28 @@ export default function App() {
       ? 'bg-amber-300'
       : 'bg-rose-400';
 
-  const ocrSourceDetail = ocrEngine === 'tesseract' && ocrFallbackReason
-    ? `Reason: ${ocrFallbackReason}`
-    : null;
+  const ocrSourceDetail =
+    ocrEngine === 'tesseract' && ocrFallbackReason
+      ? `Reason: ${ocrFallbackReason}`
+      : !ocrEngine && ocrFallbackReason
+      ? ocrFallbackReason
+      : ocrSourceInfo || null;
+
+  const getOcrModelAvailabilityText = (model: OcrModelPreference) => {
+    if (model === 'auto') {
+      return 'Adaptive fallback';
+    }
+
+    if (model === 'tesseract') {
+      return 'Always ready';
+    }
+
+    if (model === 'azure-vision') {
+      return visionBackendConfigured ? 'Remote ready' : 'Needs backend setup';
+    }
+
+    return documentIntelligenceBackendConfigured ? 'Remote ready' : 'Needs backend setup';
+  };
 
   const googleIsBusy =
     googleExportStatus === 'authorizing' ||
@@ -1224,6 +1449,61 @@ export default function App() {
           </div>
           <div className="flex-shrink-0">
             <span className={`block w-2.5 h-2.5 rounded-full ${azureStatusDotClass}`} />
+          </div>
+        </div>
+
+        <div className="mb-6 rounded-2xl border border-white/5 bg-[#1c1d23] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
+          <div className="flex items-start justify-between gap-3 mb-3">
+            <div className="min-w-0">
+              <p className="text-[#f5f5f7] text-sm font-medium truncate">OCR Model</p>
+              <p className="text-[#9aa0aa] text-xs leading-relaxed">
+                Pick how each scan should be processed. Auto keeps the old fallback behavior.
+              </p>
+            </div>
+            <span className="inline-flex items-center rounded-full border border-[#4da3ff]/25 bg-[#4da3ff]/10 px-2.5 py-1 text-[11px] font-medium text-[#8fc2ff]">
+              {selectedOcrModelLabel}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {OCR_MODEL_OPTIONS.map((option) => {
+              const isActive = ocrModelPreference === option.id;
+              const availabilityText = getOcrModelAvailabilityText(option.id);
+
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => setOcrModelPreference(option.id)}
+                  disabled={status === 'extracting'}
+                  className={`rounded-2xl border px-3.5 py-3 text-left transition-all ${
+                    isActive
+                      ? 'border-[#4da3ff]/50 bg-[#4da3ff]/12 shadow-[0_0_0_1px_rgba(77,163,255,0.08)_inset]'
+                      : 'border-white/8 bg-[#15161b] hover:bg-white/[0.03]'
+                  } ${status === 'extracting' ? 'opacity-60 cursor-not-allowed' : ''}`}
+                >
+                  <div className="flex items-start justify-between gap-3 mb-2">
+                    <span className={`text-sm font-medium ${isActive ? 'text-[#f5f5f7]' : 'text-[#d8dbe1]'}`}>
+                      {option.label}
+                    </span>
+                    <span
+                      className={`inline-flex h-2.5 w-2.5 rounded-full ${
+                        option.id === 'tesseract' ||
+                        option.id === 'auto' ||
+                        (option.id === 'azure-vision' && visionBackendConfigured) ||
+                        (option.id === 'azure-document-intelligence' && documentIntelligenceBackendConfigured)
+                          ? 'bg-emerald-300'
+                          : 'bg-amber-300'
+                      }`}
+                    />
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-[#8a919c] mb-2">{option.description}</p>
+                  <p className={`text-[11px] font-medium ${isActive ? 'text-[#8fc2ff]' : 'text-[#6f7782]'}`}>
+                    {availabilityText}
+                  </p>
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -1627,7 +1907,7 @@ export default function App() {
               onClick={handleExtract}
               className="w-full bg-[#4da3ff] text-[#0b0b0f] py-4 rounded-2xl font-medium text-[15px] hover:bg-[#4da3ff]/90 active:scale-[0.98] transition-all shadow-[0_4px_14px_rgba(77,163,255,0.25)] flex items-center justify-center gap-2"
             >
-              Extract Text
+              {ocrModelPreference === 'auto' ? 'Extract Text' : `Extract with ${selectedOcrModelLabel}`}
             </motion.button>
           )}
 
