@@ -20,7 +20,7 @@
       "command": "bash",
       "args": [
         "-lc",
-        "mkdir -p .copilot-tmp && rm -f .copilot-tmp/dev-server.pid .copilot-tmp/start-process.txt .copilot-tmp/dev-server.log; nohup npm run dev > .copilot-tmp/dev-server.log 2>&1 < /dev/null & pid=$!; echo $pid > .copilot-tmp/dev-server.pid; sleep 5; ps -p \"$pid\" -o pid=,cmd= > .copilot-tmp/start-process.txt || true"
+        "mkdir -p .copilot-tmp && rm -f .copilot-tmp/dev-server.pid .copilot-tmp/start-process.txt .copilot-tmp/dev-server.log; setsid npm run dev > .copilot-tmp/dev-server.log 2>&1 < /dev/null & pid=$!; echo $pid > .copilot-tmp/dev-server.pid; sleep 5; ps -p \"$pid\" -o pid=,cmd= > .copilot-tmp/start-process.txt || true"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
@@ -46,7 +46,7 @@
       "command": "bash",
       "args": [
         "-lc",
-        "mkdir -p .copilot-tmp && rm -f .copilot-tmp/api-server.pid .copilot-tmp/api-start-process.txt .copilot-tmp/api-server.log; nohup npm run dev:api > .copilot-tmp/api-server.log 2>&1 < /dev/null & pid=$!; echo $pid > .copilot-tmp/api-server.pid; sleep 3; ps -p \"$pid\" -o pid=,cmd= > .copilot-tmp/api-start-process.txt || true"
+        "mkdir -p .copilot-tmp && rm -f .copilot-tmp/api-server.pid .copilot-tmp/api-start-process.txt .copilot-tmp/api-server.log; setsid npm run dev:api > .copilot-tmp/api-server.log 2>&1 < /dev/null & pid=$!; echo $pid > .copilot-tmp/api-server.pid; sleep 3; ps -p \"$pid\" -o pid=,cmd= > .copilot-tmp/api-start-process.txt || true"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
