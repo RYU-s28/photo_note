@@ -797,22 +797,6 @@ export default function App() {
     const timestamp = new Date().toLocaleString();
     const entryText = `\n\n--- Note Entry (${timestamp}) ---\n${normalizeExtractedText(rawText) || 'No text was extracted.'}\n`;
 
-    // First, get the document length to find the end
-    const docResponse = await fetch(`https://docs.googleapis.com/v1/documents/${documentId}`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-    });
-
-    if (!docResponse.ok) {
-      throw new Error(await toGoogleApiErrorMessage(docResponse, 'Failed to fetch document'));
-    }
-
-    const docData = (await docResponse.json()) as { body?: { content?: Array<{ endIndex?: number }> } };
-    const endIndex = docData.body?.content?.[docData.body.content.length - 1]?.endIndex || 1;
-
     const response = await fetch(`https://docs.googleapis.com/v1/documents/${documentId}:batchUpdate`, {
       method: 'POST',
       headers: {
@@ -823,7 +807,8 @@ export default function App() {
         requests: [
           {
             insertText: {
-              location: { index: endIndex },
+              // Let Docs append at the end of the body segment to avoid index-edge errors.
+              endOfSegmentLocation: {},
               text: entryText,
             },
           },
