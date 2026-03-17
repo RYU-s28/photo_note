@@ -304,6 +304,10 @@ export default function App() {
   const [googleExportError, setGoogleExportError] = useState('');
   const [googleDocUrl, setGoogleDocUrl] = useState('');
   const [googleDocTitle, setGoogleDocTitle] = useState('');
+  const [googleDocs, setGoogleDocs] = useState<Array<{ id: string; name: string; webViewLink?: string }>>([]);
+  const [googleDocsLoading, setGoogleDocsLoading] = useState(false);
+  const [selectedGoogleDocId, setSelectedGoogleDocId] = useState<string | null>(null);
+  const [googleExportMode, setGoogleExportMode] = useState<'create' | 'append'>('create');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -763,6 +767,77 @@ export default function App() {
     }
   };
 
+  const listGoogleDocs = async (accessToken: string) => {
+    try {
+      const response = await fetch(
+        'https://www.googleapis.com/drive/v3/files?q=mimeType%3D%22application%2Fvnd.google-apps.document%22&fields=files(id,name,webViewLink)&pageSize=50&orderBy=modifiedTime%20desc',
+        {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(
+          await toGoogleApiErrorMessage(response, 'Failed to list Google Docs')
+        );
+      }
+
+      const data = (await response.json()) as { files?: Array<{ id: string; name: string; webViewLink?: string }> };
+      return data.files || [];
+    } catch (error) {
+      console.error('Error listing Google Docs:', error);
+      throw error;
+    }
+  };
+
+  const appendTextToGoogleDoc = async (accessToken: string, documentId: string, rawText: string) => {
+    const timestamp = new Date().toLocaleString();
+    const entryText = `\n\n--- Note Entry (${timestamp}) ---\n${normalizeExtractedText(rawText) || 'No text was extracted.'}\n`;
+
+    // First, get the document length to find the end
+    const docResponse = await fetch(`https://docs.googleapis.com/v1/documents/${documentId}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!docResponse.ok) {
+      throw new Error(await toGoogleApiErrorMessage(docResponse, 'Failed to fetch document'));
+    }
+
+    const docData = (await docResponse.json()) as { body?: { content?: Array<{ endIndex?: number }> } };
+    const endIndex = docData.body?.content?.[docData.body.content.length - 1]?.endIndex || 1;
+
+    const response = await fetch(`https://docs.googleapis.com/v1/documents/${documentId}:batchUpdate`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        requests: [
+          {
+            insertText: {
+              location: { index: endIndex },
+              text: entryText,
+            },
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        await toGoogleApiErrorMessage(response, 'Failed to append text to the Google Doc')
+      );
+    }
+  };
+
   const handleGoogleSignIn = async () => {
     if (!GOOGLE_CLIENT_ID) {
       setGoogleExportStatus('error');
@@ -775,6 +850,18 @@ export default function App() {
 
     try {
       await requestGoogleAccessToken('consent');
+      
+      // Load docs after successful sign-in
+      const token = googleAccessToken || (await ensureGoogleAccessToken());
+      setGoogleDocsLoading(true);
+      const docs = await listGoogleDocs(token);
+      setGoogleDocs(docs);
+      if (docs.length > 0) {
+        setSelectedGoogleDocId(docs[0].id);
+        setGoogleExportMode('append');
+      }
+      setGoogleDocsLoading(false);
+      
       setGoogleExportStatus('idle');
     } catch (error) {
       console.error('Google sign-in error:', error);
@@ -782,6 +869,7 @@ export default function App() {
       setGoogleExportError(
         error instanceof Error ? error.message : 'Google sign-in failed. Please try again.'
       );
+      setGoogleDocsLoading(false);
     }
   };
 
@@ -820,21 +908,39 @@ export default function App() {
     try {
       let accessToken = await ensureGoogleAccessToken();
 
-      const createAndPopulate = async (token: string) => {
-        setGoogleExportStatus('creating-doc');
-        const title = buildGoogleDocTitle();
-        const createdDoc = await createGoogleDoc(token, title);
+      const executeExport = async (token: string) => {
+        if (googleExportMode === 'append' && selectedGoogleDocId) {
+          // Append to existing doc
+          setGoogleExportStatus('writing-doc');
+          const selectedDoc = googleDocs.find((d) => d.id === selectedGoogleDocId);
+          await appendTextToGoogleDoc(token, selectedGoogleDocId, normalizedText);
+          const docUrl = selectedDoc?.webViewLink || `https://docs.google.com/document/d/${selectedGoogleDocId}/edit`;
+          setGoogleDocTitle(selectedDoc?.name || 'Note Document');
+          setGoogleDocUrl(docUrl);
+        } else {
+          // Create new doc
+          setGoogleExportStatus('creating-doc');
+          const title = buildGoogleDocTitle();
+          const createdDoc = await createGoogleDoc(token, title);
 
-        setGoogleExportStatus('writing-doc');
-        await insertTextIntoGoogleDoc(token, createdDoc.id!, normalizedText);
+          setGoogleExportStatus('writing-doc');
+          await insertTextIntoGoogleDoc(token, createdDoc.id!, normalizedText);
 
-        const docUrl = createdDoc.webViewLink || `https://docs.google.com/document/d/${createdDoc.id}/edit`;
-        setGoogleDocTitle(title);
-        setGoogleDocUrl(docUrl);
+          const docUrl = createdDoc.webViewLink || `https://docs.google.com/document/d/${createdDoc.id}/edit`;
+          setGoogleDocTitle(title);
+          setGoogleDocUrl(docUrl);
+          
+          // Refresh docs list and select new doc
+          const docs = await listGoogleDocs(token);
+          setGoogleDocs(docs);
+          if (createdDoc.id) {
+            setSelectedGoogleDocId(createdDoc.id);
+          }
+        }
       };
 
       try {
-        await createAndPopulate(accessToken);
+        await executeExport(accessToken);
       } catch (error) {
         const message = error instanceof Error ? error.message.toLowerCase() : '';
         const unauthorized = message.includes('http 401');
@@ -844,7 +950,7 @@ export default function App() {
         }
 
         accessToken = await requestGoogleAccessToken('consent');
-        await createAndPopulate(accessToken);
+        await executeExport(accessToken);
       }
 
       setGoogleExportStatus('done');
@@ -1421,6 +1527,58 @@ export default function App() {
                     </a>
                   ) : null}
 
+                  {googleConnected && googleDocs.length > 0 && (
+                    <div className="space-y-2 pt-2">
+                      <label className="text-[#9aa0aa] text-xs font-medium block">Export mode</label>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => setGoogleExportMode('create')}
+                          className={`flex-1 px-3 py-2 rounded-lg text-xs font-medium transition-all border ${
+                            googleExportMode === 'create'
+                              ? 'bg-[#4da3ff]/20 border-[#4da3ff]/50 text-[#4da3ff]'
+                              : 'bg-white/[0.02] border-white/10 text-[#9aa0aa] hover:bg-white/[0.04]'
+                          }`}
+                        >
+                          Create new
+                        </button>
+                        <button
+                          onClick={() => setGoogleExportMode('append')}
+                          className={`flex-1 px-3 py-2 rounded-lg text-xs font-medium transition-all border ${
+                            googleExportMode === 'append'
+                              ? 'bg-[#4da3ff]/20 border-[#4da3ff]/50 text-[#4da3ff]'
+                              : 'bg-white/[0.02] border-white/10 text-[#9aa0aa] hover:bg-white/[0.04]'
+                          }`}
+                        >
+                          Add to existing
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {googleConnected && googleExportMode === 'append' && (
+                    <div className="space-y-2">
+                      <label className="text-[#9aa0aa] text-xs font-medium block">Select document</label>
+                      {googleDocsLoading ? (
+                        <div className="flex items-center justify-center py-3 text-[#9aa0aa] text-xs">
+                          <Loader2 className="w-3 h-3 animate-spin mr-2" />
+                          Loading docs...
+                        </div>
+                      ) : (
+                        <select
+                          value={selectedGoogleDocId || ''}
+                          onChange={(e) => setSelectedGoogleDocId(e.target.value)}
+                          className="w-full px-3 py-2 bg-[#15161b] border border-white/10 rounded-lg text-[#f5f5f7] text-xs font-medium focus:outline-none focus:border-[#4da3ff]/50 transition-colors cursor-pointer"
+                        >
+                          {googleDocs.map((doc) => (
+                            <option key={doc.id} value={doc.id}>
+                              {doc.name}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                    </div>
+                  )}
+
                   <div className="flex flex-wrap gap-2">
                     <button
                       onClick={handleGoogleSignIn}
@@ -1437,7 +1595,7 @@ export default function App() {
 
                     <button
                       onClick={handleExportToGoogleDocs}
-                      disabled={googleAuthStatus !== 'ready' || googleIsBusy || !hasExportableText}
+                      disabled={googleAuthStatus !== 'ready' || googleIsBusy || !hasExportableText || (googleExportMode === 'append' && !selectedGoogleDocId)}
                       className="inline-flex items-center gap-2 px-3.5 py-2 bg-[#4da3ff] text-[#0b0b0f] border border-[#4da3ff]/80 rounded-xl text-xs font-medium hover:bg-[#4da3ff]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                     >
                       {googleExportStatus === 'creating-doc' || googleExportStatus === 'writing-doc' ? (
@@ -1448,8 +1606,8 @@ export default function App() {
                       {googleExportStatus === 'creating-doc'
                         ? 'Creating Doc...'
                         : googleExportStatus === 'writing-doc'
-                        ? 'Writing Notes...'
-                        : 'Create Google Doc'}
+                        ? googleExportMode === 'append' ? 'Adding Entry...' : 'Writing Notes...'
+                        : googleExportMode === 'create' ? 'Create Google Doc' : 'Add to Doc'}
                     </button>
 
                     {googleConnected ? (

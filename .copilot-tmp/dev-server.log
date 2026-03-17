@@ -2,14 +2,14 @@
 > @figma/my-make-file@0.0.1 dev
 > concurrently -k -n API,WEB -c green,cyan "npm run dev:api" "npm run dev:web"
 
-[API] 
-[API] > @figma/my-make-file@0.0.1 dev:api
-[API] > node server/index.mjs
-[API] 
 [WEB] 
 [WEB] > @figma/my-make-file@0.0.1 dev:web
 [WEB] > vite --host 0.0.0.0 --port 5173
 [WEB] 
+[API] 
+[API] > @figma/my-make-file@0.0.1 dev:api
+[API] > node server/index.mjs
+[API] 
 [API] [api] OCR backend listening on http://localhost:8787
 [API] npm run dev:api exited with code 0
 --> Sending SIGTERM to other processes..
