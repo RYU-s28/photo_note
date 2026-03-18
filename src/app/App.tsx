@@ -360,7 +360,7 @@ export default function App() {
   const [extractedText, setExtractedText] = useState<string>('');
   const [ocrEngine, setOcrEngine] = useState<OcrEngine | null>(null);
   const [ocrModelPreference, setOcrModelPreference] = useState<OcrModelPreference>('auto');
-  const [isModelSelectorOpen, setIsModelSelectorOpen] = useState(true);
+  const [isModelSelectorOpen, setIsModelSelectorOpen] = useState(false);
   const [ocrFallbackReason, setOcrFallbackReason] = useState('');
   const [ocrSourceInfo, setOcrSourceInfo] = useState('');
   const [copied, setCopied] = useState(false);
