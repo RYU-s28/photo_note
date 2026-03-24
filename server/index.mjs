@@ -163,33 +163,385 @@ const readResponseBody = async response => {
   }
 };
 
-const extractImageAnalysisText = payload => {
+const toNumberOrNull = value => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const toXYPoint = point => {
+  if (point && typeof point === 'object') {
+    const x = toNumberOrNull(point.x);
+    const y = toNumberOrNull(point.y);
+    if (x !== null && y !== null) {
+      return { x, y };
+    }
+  }
+
+  return null;
+};
+
+const parsePolygonPoints = polygon => {
+  if (!Array.isArray(polygon) || polygon.length === 0) {
+    return [];
+  }
+
+  if (typeof polygon[0] === 'number') {
+    const points = [];
+    for (let index = 0; index + 1 < polygon.length; index += 2) {
+      const x = toNumberOrNull(polygon[index]);
+      const y = toNumberOrNull(polygon[index + 1]);
+      if (x !== null && y !== null) {
+        points.push({ x, y });
+      }
+    }
+    return points;
+  }
+
+  return polygon.map(toXYPoint).filter(Boolean);
+};
+
+const pointsToBounds = points => {
+  if (!Array.isArray(points) || points.length === 0) {
+    return null;
+  }
+
+  const xs = points.map(point => point.x);
+  const ys = points.map(point => point.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+
+  if (![minX, maxX, minY, maxY].every(Number.isFinite)) {
+    return null;
+  }
+
+  return { minX, maxX, minY, maxY };
+};
+
+const normalizeBounds = (bounds, width, height) => {
+  if (!bounds) {
+    return null;
+  }
+
+  const safeWidth = Number.isFinite(width) && width > 0 ? width : null;
+  const safeHeight = Number.isFinite(height) && height > 0 ? height : null;
+
+  const minX = safeWidth ? bounds.minX / safeWidth : bounds.minX;
+  const maxX = safeWidth ? bounds.maxX / safeWidth : bounds.maxX;
+  const minY = safeHeight ? bounds.minY / safeHeight : bounds.minY;
+  const maxY = safeHeight ? bounds.maxY / safeHeight : bounds.maxY;
+
+  if (![minX, maxX, minY, maxY].every(Number.isFinite)) {
+    return null;
+  }
+
+  if (!safeWidth || !safeHeight) {
+    return { minX, maxX, minY, maxY };
+  }
+
+  return {
+    minX: Math.min(Math.max(minX, 0), 1),
+    maxX: Math.min(Math.max(maxX, 0), 1),
+    minY: Math.min(Math.max(minY, 0), 1),
+    maxY: Math.min(Math.max(maxY, 0), 1),
+  };
+};
+
+const normalizeLineBounds = rawLines => {
+  const rawMinX = Math.min(...rawLines.map(line => line.bounds.minX));
+  const rawMaxX = Math.max(...rawLines.map(line => line.bounds.maxX));
+  const rawMinY = Math.min(...rawLines.map(line => line.bounds.minY));
+  const rawMaxY = Math.max(...rawLines.map(line => line.bounds.maxY));
+
+  const alreadyNormalized =
+    rawMinX >= 0 && rawMaxX <= 1.05 && rawMinY >= 0 && rawMaxY <= 1.05 && rawMaxX > 0 && rawMaxY > 0;
+
+  if (alreadyNormalized) {
+    return rawLines.map(line => ({
+      ...line,
+      bounds: {
+        minX: Math.min(Math.max(line.bounds.minX, 0), 1),
+        maxX: Math.min(Math.max(line.bounds.maxX, 0), 1),
+        minY: Math.min(Math.max(line.bounds.minY, 0), 1),
+        maxY: Math.min(Math.max(line.bounds.maxY, 0), 1),
+      },
+    }));
+  }
+
+  const spanX = rawMaxX - rawMinX;
+  const spanY = rawMaxY - rawMinY;
+  const safeSpanX = spanX > 0 ? spanX : 1;
+  const safeSpanY = spanY > 0 ? spanY : 1;
+
+  return rawLines.map(line => ({
+    ...line,
+    bounds: {
+      minX: (line.bounds.minX - rawMinX) / safeSpanX,
+      maxX: (line.bounds.maxX - rawMinX) / safeSpanX,
+      minY: (line.bounds.minY - rawMinY) / safeSpanY,
+      maxY: (line.bounds.maxY - rawMinY) / safeSpanY,
+    },
+  }));
+};
+
+const weightedQuantile = (items, selector, weightSelector, quantile) => {
+  const normalizedQuantile = Math.min(Math.max(quantile, 0), 1);
+  const sorted = items
+    .map(item => ({
+      value: selector(item),
+      weight: Math.max(weightSelector(item), 0),
+    }))
+    .filter(item => Number.isFinite(item.value) && Number.isFinite(item.weight) && item.weight > 0)
+    .sort((left, right) => left.value - right.value);
+
+  if (sorted.length === 0) {
+    return null;
+  }
+
+  const totalWeight = sorted.reduce((sum, item) => sum + item.weight, 0);
+  const threshold = totalWeight * normalizedQuantile;
+  let cumulativeWeight = 0;
+
+  for (const item of sorted) {
+    cumulativeWeight += item.weight;
+    if (cumulativeWeight >= threshold) {
+      return item.value;
+    }
+  }
+
+  return sorted[sorted.length - 1].value;
+};
+
+const lineToNormalizedMetrics = line => {
+  const width = Math.max(0, line.bounds.maxX - line.bounds.minX);
+  const height = Math.max(0, line.bounds.maxY - line.bounds.minY);
+  return {
+    ...line,
+    width,
+    height,
+    centerX: line.bounds.minX + width / 2,
+    centerY: line.bounds.minY + height / 2,
+    textLength: line.text.length,
+  };
+};
+
+const isLikelySlideNumber = line => {
+  const trimmedText = line.text.trim();
+  if (!trimmedText) {
+    return false;
+  }
+
+  const plainNumberPattern = /^\d{1,3}$/;
+  const fractionPattern = /^\d{1,3}\s*\/\s*\d{1,3}$/;
+  const slideNumberPattern = /^(slide|page)\s*\d{1,3}$/i;
+  const numberedLabelPattern = /^(slide|page)\s*\d{1,3}\s*\/\s*\d{1,3}$/i;
+  const looksNumeric =
+    plainNumberPattern.test(trimmedText) ||
+    fractionPattern.test(trimmedText) ||
+    slideNumberPattern.test(trimmedText) ||
+    numberedLabelPattern.test(trimmedText);
+
+  if (!looksNumeric) {
+    return false;
+  }
+
+  const nearBottom = line.centerY > 0.86;
+  const nearSides = line.centerX < 0.22 || line.centerX > 0.78;
+  const shortToken = line.textLength <= 12;
+
+  return nearBottom && nearSides && shortToken;
+};
+
+const focusSlideLines = rawLines => {
+  const normalized = normalizeLineBounds(rawLines)
+    .map(lineToNormalizedMetrics)
+    .filter(line => line.textLength > 0);
+
+  if (normalized.length < 4) {
+    return normalized;
+  }
+
+  const weighted = normalized.map(line => ({
+    ...line,
+    weight: Math.max(1, Math.min(80, line.textLength)) * Math.max(0.01, line.height),
+  }));
+
+  const dominantXMin = weightedQuantile(
+    weighted,
+    line => line.bounds.minX,
+    line => line.weight,
+    0.08
+  );
+  const dominantXMax = weightedQuantile(
+    weighted,
+    line => line.bounds.maxX,
+    line => line.weight,
+    0.92
+  );
+  const dominantYMin = weightedQuantile(
+    weighted,
+    line => line.bounds.minY,
+    line => line.weight,
+    0.1
+  );
+  const dominantYMax = weightedQuantile(
+    weighted,
+    line => line.bounds.maxY,
+    line => line.weight,
+    0.9
+  );
+
+  const hasDominantBox =
+    dominantXMin !== null &&
+    dominantXMax !== null &&
+    dominantYMin !== null &&
+    dominantYMax !== null &&
+    dominantXMax > dominantXMin &&
+    dominantYMax > dominantYMin;
+
+  const dominantBounds = hasDominantBox
+    ? {
+        minX: Math.max(0, dominantXMin - 0.03),
+        maxX: Math.min(1, dominantXMax + 0.03),
+        minY: Math.max(0, dominantYMin - 0.04),
+        maxY: Math.min(1, dominantYMax + 0.04),
+      }
+    : null;
+
+  const dominantLines = dominantBounds
+    ? weighted.filter(
+        line =>
+          line.centerX >= dominantBounds.minX &&
+          line.centerX <= dominantBounds.maxX &&
+          line.centerY >= dominantBounds.minY &&
+          line.centerY <= dominantBounds.maxY
+      )
+    : weighted;
+
+  const withoutSlideNumbers = dominantLines.filter(line => !isLikelySlideNumber(line));
+
+  // Avoid over-filtering by keeping the original text set if we removed too much.
+  if (withoutSlideNumbers.length >= Math.max(3, Math.floor(normalized.length * 0.35))) {
+    return withoutSlideNumbers;
+  }
+
+  return weighted;
+};
+
+const linesToText = lines => {
+  return lines
+    .map(line => line.text.trim())
+    .filter(Boolean)
+    .join('\n');
+};
+
+const extractImageAnalysisLines = payload => {
   const blocks = payload?.readResult?.blocks;
   if (!Array.isArray(blocks)) {
+    return [];
+  }
+
+  const rawLines = blocks.flatMap(block => {
+    const lines = Array.isArray(block?.lines) ? block.lines : [];
+    return lines
+      .map(line => {
+        const text = typeof line?.text === 'string' ? line.text.trim() : '';
+        const points = parsePolygonPoints(line?.boundingPolygon);
+        const bounds = normalizeBounds(pointsToBounds(points), null, null);
+        if (!text || !bounds) {
+          return null;
+        }
+
+        return { text, bounds };
+      })
+      .filter(Boolean);
+  });
+
+  return rawLines;
+};
+
+const extractLegacyReadLines = payload => {
+  const pages = payload?.analyzeResult?.readResults;
+  if (!Array.isArray(pages)) {
+    return [];
+  }
+
+  return pages.flatMap(page => {
+    const width = toNumberOrNull(page?.width);
+    const height = toNumberOrNull(page?.height);
+    const lines = Array.isArray(page?.lines) ? page.lines : [];
+    return lines
+      .map(line => {
+        const text = typeof line?.text === 'string' ? line.text.trim() : '';
+        const points = parsePolygonPoints(line?.boundingBox);
+        const bounds = normalizeBounds(pointsToBounds(points), width, height);
+        if (!text || !bounds) {
+          return null;
+        }
+
+        return { text, bounds };
+      })
+      .filter(Boolean);
+  });
+};
+
+const extractDocumentIntelligenceLines = payload => {
+  const pages = payload?.analyzeResult?.pages;
+  if (!Array.isArray(pages)) {
+    return [];
+  }
+
+  return pages.flatMap(page => {
+    const width = toNumberOrNull(page?.width);
+    const height = toNumberOrNull(page?.height);
+    const lines = Array.isArray(page?.lines) ? page.lines : [];
+
+    return lines
+      .map(line => {
+        const textCandidate =
+          typeof line?.content === 'string'
+            ? line.content
+            : typeof line?.text === 'string'
+              ? line.text
+              : '';
+
+        const text = textCandidate.trim();
+        const points = parsePolygonPoints(line?.polygon || line?.boundingPolygon);
+        const bounds = normalizeBounds(pointsToBounds(points), width, height);
+        if (!text || !bounds) {
+          return null;
+        }
+
+        return { text, bounds };
+      })
+      .filter(Boolean);
+  });
+};
+
+const extractFocusedText = extractedLines => {
+  if (!Array.isArray(extractedLines) || extractedLines.length === 0) {
     return '';
   }
 
-  const lines = blocks.flatMap(block => (Array.isArray(block?.lines) ? block.lines : []));
-  return lines
-    .map(line => (typeof line?.text === 'string' ? line.text.trim() : ''))
-    .filter(Boolean)
-    .join('\n');
+  const focusedLines = focusSlideLines(extractedLines);
+  return linesToText(focusedLines);
+};
+
+const extractImageAnalysisText = payload => {
+  return extractFocusedText(extractImageAnalysisLines(payload));
 };
 
 const extractLegacyReadText = payload => {
-  const pages = payload?.analyzeResult?.readResults;
-  if (!Array.isArray(pages)) {
-    return '';
-  }
-
-  const lines = pages.flatMap(page => (Array.isArray(page?.lines) ? page.lines : []));
-  return lines
-    .map(line => (typeof line?.text === 'string' ? line.text.trim() : ''))
-    .filter(Boolean)
-    .join('\n');
+  return extractFocusedText(extractLegacyReadLines(payload));
 };
 
 const extractDocumentIntelligenceText = payload => {
+  const focusedText = extractFocusedText(extractDocumentIntelligenceLines(payload));
+  if (focusedText) {
+    return focusedText;
+  }
+
   if (
     payload?.analyzeResult &&
     typeof payload.analyzeResult.content === 'string' &&
@@ -198,26 +550,7 @@ const extractDocumentIntelligenceText = payload => {
     return payload.analyzeResult.content.trim();
   }
 
-  const pages = payload?.analyzeResult?.pages;
-  if (!Array.isArray(pages)) {
-    return '';
-  }
-
-  const lines = pages.flatMap(page => (Array.isArray(page?.lines) ? page.lines : []));
-  return lines
-    .map(line => {
-      if (typeof line?.content === 'string') {
-        return line.content.trim();
-      }
-
-      if (typeof line?.text === 'string') {
-        return line.text.trim();
-      }
-
-      return '';
-    })
-    .filter(Boolean)
-    .join('\n');
+  return '';
 };
 
 const toErrorString = payload => {

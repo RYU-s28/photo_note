@@ -109,9 +109,40 @@ const GOOGLE_CLIENT_ID_SETUP_HINT =
   'Set VITE_GOOGLE_CLIENT_ID in your build environment. For GitHub Pages, add it in Settings > Secrets and variables > Actions, then redeploy.';
 const GOOGLE_OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
+  'https://www.googleapis.com/auth/drive.metadata.readonly',
   'https://www.googleapis.com/auth/documents',
 ].join(' ');
 const GOOGLE_IDENTITY_SCRIPT_SRC = 'https://accounts.google.com/gsi/client';
+const GOOGLE_SELECTED_DOC_ID_STORAGE_KEY = 'photo-note.google.selected-doc-id';
+const GOOGLE_EXPORT_MODE_STORAGE_KEY = 'photo-note.google.export-mode';
+const GOOGLE_NEW_DOC_NAME_STORAGE_KEY = 'photo-note.google.new-doc-name';
+
+const getStoredGoogleExportMode = (): 'create' | 'append' => {
+  if (typeof window === 'undefined') {
+    return 'append';
+  }
+
+  const storedValue = window.localStorage.getItem(GOOGLE_EXPORT_MODE_STORAGE_KEY);
+  return storedValue === 'create' ? 'create' : 'append';
+};
+
+const getStoredSelectedGoogleDocId = () => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  const storedValue = window.localStorage.getItem(GOOGLE_SELECTED_DOC_ID_STORAGE_KEY);
+  return storedValue && storedValue.trim() ? storedValue.trim() : null;
+};
+
+const getStoredGoogleNewDocName = () => {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+
+  return window.localStorage.getItem(GOOGLE_NEW_DOC_NAME_STORAGE_KEY) || '';
+};
+
 const OCR_MODEL_OPTIONS: Array<{
   id: OcrModelPreference;
   label: string;
@@ -390,8 +421,13 @@ export default function App() {
   const [googleDocTitle, setGoogleDocTitle] = useState('');
   const [googleDocs, setGoogleDocs] = useState<Array<{ id: string; name: string; webViewLink?: string }>>([]);
   const [googleDocsLoading, setGoogleDocsLoading] = useState(false);
-  const [selectedGoogleDocId, setSelectedGoogleDocId] = useState<string | null>(null);
-  const [googleExportMode, setGoogleExportMode] = useState<'create' | 'append'>('create');
+  const [googleNewDocName, setGoogleNewDocName] = useState<string>(getStoredGoogleNewDocName);
+  const [selectedGoogleDocId, setSelectedGoogleDocId] = useState<string | null>(
+    getStoredSelectedGoogleDocId()
+  );
+  const [googleExportMode, setGoogleExportMode] = useState<'create' | 'append'>(
+    getStoredGoogleExportMode
+  );
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -862,7 +898,7 @@ export default function App() {
   const listGoogleDocs = async (accessToken: string) => {
     try {
       const response = await fetch(
-        'https://www.googleapis.com/drive/v3/files?q=mimeType%3D%22application%2Fvnd.google-apps.document%22&fields=files(id,name,webViewLink)&pageSize=50&orderBy=modifiedTime%20desc',
+        'https://www.googleapis.com/drive/v3/files?q=mimeType%3D%22application%2Fvnd.google-apps.document%22%20and%20trashed%3Dfalse&fields=files(id,name,webViewLink)&pageSize=200&orderBy=modifiedTime%20desc',
         {
           method: 'GET',
           headers: {
@@ -882,6 +918,28 @@ export default function App() {
     } catch (error) {
       console.error('Error listing Google Docs:', error);
       throw error;
+    }
+  };
+
+  const loadGoogleDocsForSession = async (accessToken: string) => {
+    setGoogleDocsLoading(true);
+
+    try {
+      const docs = await listGoogleDocs(accessToken);
+      setGoogleDocs(docs);
+
+      const storedDocId = getStoredSelectedGoogleDocId();
+      const hasStoredDoc = Boolean(storedDocId && docs.some(doc => doc.id === storedDocId));
+      const fallbackDocId = docs.length > 0 ? docs[0].id : null;
+      const nextSelectedDocId = hasStoredDoc ? storedDocId : fallbackDocId;
+
+      setSelectedGoogleDocId(nextSelectedDocId || null);
+
+      if (docs.length > 0) {
+        setGoogleExportMode(previousMode => (previousMode === 'create' ? 'create' : 'append'));
+      }
+    } finally {
+      setGoogleDocsLoading(false);
     }
   };
 
@@ -926,19 +984,8 @@ export default function App() {
     setGoogleExportStatus('authorizing');
 
     try {
-      await requestGoogleAccessToken('consent');
-      
-      // Load docs after successful sign-in
-      const token = googleAccessToken || (await ensureGoogleAccessToken());
-      setGoogleDocsLoading(true);
-      const docs = await listGoogleDocs(token);
-      setGoogleDocs(docs);
-      if (docs.length > 0) {
-        setSelectedGoogleDocId(docs[0].id);
-        setGoogleExportMode('append');
-      }
-      setGoogleDocsLoading(false);
-      
+      const token = await requestGoogleAccessToken('consent');
+      await loadGoogleDocsForSession(token);
       setGoogleExportStatus('idle');
     } catch (error) {
       console.error('Google sign-in error:', error);
@@ -946,7 +993,6 @@ export default function App() {
       setGoogleExportError(
         error instanceof Error ? error.message : 'Google sign-in failed. Please try again.'
       );
-      setGoogleDocsLoading(false);
     }
   };
 
@@ -961,8 +1007,44 @@ export default function App() {
 
     setGoogleAccessToken(null);
     setGoogleAccessTokenExpiresAt(0);
+    setGoogleDocs([]);
+    setSelectedGoogleDocId(getStoredSelectedGoogleDocId());
     resetGoogleExportFeedback();
   };
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    if (selectedGoogleDocId) {
+      window.localStorage.setItem(GOOGLE_SELECTED_DOC_ID_STORAGE_KEY, selectedGoogleDocId);
+      return;
+    }
+
+    window.localStorage.removeItem(GOOGLE_SELECTED_DOC_ID_STORAGE_KEY);
+  }, [selectedGoogleDocId]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    window.localStorage.setItem(GOOGLE_EXPORT_MODE_STORAGE_KEY, googleExportMode);
+  }, [googleExportMode]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    if (googleNewDocName.trim()) {
+      window.localStorage.setItem(GOOGLE_NEW_DOC_NAME_STORAGE_KEY, googleNewDocName);
+      return;
+    }
+
+    window.localStorage.removeItem(GOOGLE_NEW_DOC_NAME_STORAGE_KEY);
+  }, [googleNewDocName]);
 
   const handleExportToGoogleDocs = async () => {
     const normalizedText = normalizeExtractedText(extractedText);
@@ -997,7 +1079,7 @@ export default function App() {
         } else {
           // Create new doc
           setGoogleExportStatus('creating-doc');
-          const title = buildGoogleDocTitle();
+          const title = googleNewDocName.trim() || buildGoogleDocTitle();
           const createdDoc = await createGoogleDoc(token, title);
 
           setGoogleExportStatus('writing-doc');
@@ -1012,6 +1094,7 @@ export default function App() {
           setGoogleDocs(docs);
           if (createdDoc.id) {
             setSelectedGoogleDocId(createdDoc.id);
+            setGoogleExportMode('append');
           }
         }
       };
@@ -1788,139 +1871,171 @@ export default function App() {
                 </div>
 
                 {/* Google Docs Export */}
-                <div className="bg-[#1c1d23] border border-white/5 rounded-3xl p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] space-y-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-[#f5f5f7] text-sm font-medium truncate">Google Docs Export</p>
-                      <p className="text-[#9aa0aa] text-xs truncate">{googleStatusLabel}</p>
-                    </div>
-                    <span
-                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] rounded-full border ${googleConnectionPillClass}`}
-                    >
-                      <span className={`w-1.5 h-1.5 rounded-full ${googleConnected ? 'bg-emerald-300' : 'bg-[#7f8692]'}`} />
-                      {googleConnected ? 'Connected' : 'Not connected'}
-                    </span>
-                  </div>
-
-                  <p className="text-[#7f8692] text-[11px]">{googleStatusDetail}</p>
-
-                  {googleExportError ? (
-                    <p className="text-rose-200 text-xs bg-rose-500/10 border border-rose-500/20 rounded-xl px-3 py-2">
-                      {googleExportError}
-                    </p>
-                  ) : null}
-
-                  {googleDocUrl ? (
-                    <a
-                      href={googleDocUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-2 px-3 py-2 bg-[#15161b] text-[#4da3ff] border border-[#4da3ff]/25 rounded-xl text-xs font-medium hover:bg-[#4da3ff]/10 transition-colors"
-                    >
-                      <ExternalLink className="w-3.5 h-3.5" />
-                      {googleDocTitle ? `Open ${googleDocTitle}` : 'Open Google Doc'}
-                    </a>
-                  ) : null}
-
-                  {googleConnected && googleDocs.length > 0 && (
-                    <div className="space-y-2 pt-2">
-                      <label className="text-[#9aa0aa] text-xs font-medium block">Export mode</label>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => setGoogleExportMode('create')}
-                          className={`flex-1 px-3 py-2 rounded-lg text-xs font-medium transition-all border ${
-                            googleExportMode === 'create'
-                              ? 'bg-[#4da3ff]/20 border-[#4da3ff]/50 text-[#4da3ff]'
-                              : 'bg-white/[0.02] border-white/10 text-[#9aa0aa] hover:bg-white/[0.04]'
-                          }`}
-                        >
-                          Create new
-                        </button>
-                        <button
-                          onClick={() => setGoogleExportMode('append')}
-                          className={`flex-1 px-3 py-2 rounded-lg text-xs font-medium transition-all border ${
-                            googleExportMode === 'append'
-                              ? 'bg-[#4da3ff]/20 border-[#4da3ff]/50 text-[#4da3ff]'
-                              : 'bg-white/[0.02] border-white/10 text-[#9aa0aa] hover:bg-white/[0.04]'
-                          }`}
-                        >
-                          Add to existing
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {googleConnected && googleExportMode === 'append' && (
-                    <div className="space-y-2">
-                      <label className="text-[#9aa0aa] text-xs font-medium block">Select document</label>
-                      {googleDocsLoading ? (
-                        <div className="flex items-center justify-center py-3 text-[#9aa0aa] text-xs">
-                          <Loader2 className="w-3 h-3 animate-spin mr-2" />
-                          Loading docs...
-                        </div>
-                      ) : (
-                        <select
-                          value={selectedGoogleDocId || ''}
-                          onChange={(e) => setSelectedGoogleDocId(e.target.value)}
-                          className="w-full px-3 py-2 bg-[#15161b] border border-white/10 rounded-lg text-[#f5f5f7] text-xs font-medium focus:outline-none focus:border-[#4da3ff]/50 transition-colors cursor-pointer"
-                        >
-                          {googleDocs.map((doc) => (
-                            <option key={doc.id} value={doc.id}>
-                              {doc.name}
-                            </option>
-                          ))}
-                        </select>
-                      )}
-                    </div>
-                  )}
-
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      onClick={handleGoogleSignIn}
-                      disabled={googleAuthStatus !== 'ready' || googleIsBusy}
-                      className="inline-flex items-center gap-2 px-3.5 py-2 bg-white/[0.04] text-[#f5f5f7] border border-white/10 rounded-xl text-xs font-medium hover:bg-white/[0.08] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      {googleIsBusy && googleExportStatus === 'authorizing' ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <LogIn className="w-3.5 h-3.5" />
-                      )}
-                      {googleConnected ? 'Re-auth Google' : 'Sign in with Google'}
-                    </button>
-
-                    <button
-                      onClick={handleExportToGoogleDocs}
-                      disabled={googleAuthStatus !== 'ready' || googleIsBusy || !hasExportableText || (googleExportMode === 'append' && !selectedGoogleDocId)}
-                      className="inline-flex items-center gap-2 px-3.5 py-2 bg-[#4da3ff] text-[#0b0b0f] border border-[#4da3ff]/80 rounded-xl text-xs font-medium hover:bg-[#4da3ff]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      {googleExportStatus === 'creating-doc' || googleExportStatus === 'writing-doc' ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <FileUp className="w-3.5 h-3.5" />
-                      )}
-                      {googleExportStatus === 'creating-doc'
-                        ? 'Creating Doc...'
-                        : googleExportStatus === 'writing-doc'
-                        ? googleExportMode === 'append' ? 'Adding Entry...' : 'Writing Notes...'
-                        : googleExportMode === 'create' ? 'Create Google Doc' : 'Add to Doc'}
-                    </button>
-
-                    {googleConnected ? (
-                      <button
-                        onClick={handleGoogleDisconnect}
-                        disabled={googleIsBusy}
-                        className="inline-flex items-center gap-2 px-3.5 py-2 bg-white/[0.02] text-[#9aa0aa] border border-white/10 rounded-xl text-xs font-medium hover:bg-white/[0.06] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                      >
-                        <LogOut className="w-3.5 h-3.5" />
-                        Disconnect
-                      </button>
-                    ) : null}
-                  </div>
-                </div>
               </motion.div>
             )}
 
           </AnimatePresence>
+
+          {/* Google Docs Export */}
+          <div className="bg-[#1c1d23] border border-white/5 rounded-3xl p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-[#f5f5f7] text-sm font-medium truncate">Google Docs Export</p>
+                <p className="text-[#9aa0aa] text-xs truncate">{googleStatusLabel}</p>
+              </div>
+              <span
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] rounded-full border ${googleConnectionPillClass}`}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${googleConnected ? 'bg-emerald-300' : 'bg-[#7f8692]'}`} />
+                {googleConnected ? 'Connected' : 'Not connected'}
+              </span>
+            </div>
+
+            <p className="text-[#7f8692] text-[11px]">{googleStatusDetail}</p>
+
+            {googleExportError ? (
+              <p className="text-rose-200 text-xs bg-rose-500/10 border border-rose-500/20 rounded-xl px-3 py-2">
+                {googleExportError}
+              </p>
+            ) : null}
+
+            {googleDocUrl ? (
+              <a
+                href={googleDocUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-2 px-3 py-2 bg-[#15161b] text-[#4da3ff] border border-[#4da3ff]/25 rounded-xl text-xs font-medium hover:bg-[#4da3ff]/10 transition-colors"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                {googleDocTitle ? `Open ${googleDocTitle}` : 'Open Google Doc'}
+              </a>
+            ) : null}
+
+            {googleConnected ? (
+              <div className="space-y-2 pt-2">
+                <label className="text-[#9aa0aa] text-xs font-medium block">Export mode</label>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setGoogleExportMode('create')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-xs font-medium transition-all border ${
+                      googleExportMode === 'create'
+                        ? 'bg-[#4da3ff]/20 border-[#4da3ff]/50 text-[#4da3ff]'
+                        : 'bg-white/[0.02] border-white/10 text-[#9aa0aa] hover:bg-white/[0.04]'
+                    }`}
+                  >
+                    Create new
+                  </button>
+                  <button
+                    onClick={() => setGoogleExportMode('append')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-xs font-medium transition-all border ${
+                      googleExportMode === 'append'
+                        ? 'bg-[#4da3ff]/20 border-[#4da3ff]/50 text-[#4da3ff]'
+                        : 'bg-white/[0.02] border-white/10 text-[#9aa0aa] hover:bg-white/[0.04]'
+                    }`}
+                  >
+                    Add to existing
+                  </button>
+                </div>
+              </div>
+            ) : null}
+
+            {googleConnected && googleExportMode === 'append' ? (
+              <div className="space-y-2">
+                <label className="text-[#9aa0aa] text-xs font-medium block">Select document</label>
+                {googleDocsLoading ? (
+                  <div className="flex items-center justify-center py-3 text-[#9aa0aa] text-xs">
+                    <Loader2 className="w-3 h-3 animate-spin mr-2" />
+                    Loading docs...
+                  </div>
+                ) : googleDocs.length > 0 ? (
+                  <select
+                    value={selectedGoogleDocId || ''}
+                    onChange={(e) => setSelectedGoogleDocId(e.target.value)}
+                    className="w-full px-3 py-2 bg-[#15161b] border border-white/10 rounded-lg text-[#f5f5f7] text-xs font-medium focus:outline-none focus:border-[#4da3ff]/50 transition-colors cursor-pointer"
+                  >
+                    {googleDocs.map((doc) => (
+                      <option key={doc.id} value={doc.id}>
+                        {doc.name}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <p className="text-[#9aa0aa] text-xs bg-white/[0.02] border border-white/10 rounded-lg px-3 py-2">
+                    No Docs found. Create one first, then switch to Add to existing.
+                  </p>
+                )}
+              </div>
+            ) : null}
+
+            {googleConnected && googleExportMode === 'create' ? (
+              <div className="space-y-2">
+                <label htmlFor="google-new-doc-name" className="text-[#9aa0aa] text-xs font-medium block">
+                  New document name
+                </label>
+                <input
+                  id="google-new-doc-name"
+                  type="text"
+                  value={googleNewDocName}
+                  onChange={(e) => setGoogleNewDocName(e.target.value)}
+                  maxLength={180}
+                  placeholder="Photo Note - Biology Lecture"
+                  className="w-full px-3 py-2 bg-[#15161b] border border-white/10 rounded-lg text-[#f5f5f7] text-xs font-medium placeholder:text-[#7f8692] focus:outline-none focus:border-[#4da3ff]/50 transition-colors"
+                />
+                <p className="text-[#7f8692] text-[11px]">
+                  Leave blank to use an automatic name with date and time.
+                </p>
+              </div>
+            ) : null}
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={handleGoogleSignIn}
+                disabled={googleAuthStatus !== 'ready' || googleIsBusy}
+                className="inline-flex items-center gap-2 px-3.5 py-2 bg-white/[0.04] text-[#f5f5f7] border border-white/10 rounded-xl text-xs font-medium hover:bg-white/[0.08] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {googleIsBusy && googleExportStatus === 'authorizing' ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <LogIn className="w-3.5 h-3.5" />
+                )}
+                {googleConnected ? 'Re-auth Google' : 'Sign in with Google'}
+              </button>
+
+              <button
+                onClick={handleExportToGoogleDocs}
+                disabled={googleAuthStatus !== 'ready' || googleIsBusy || !hasExportableText || (googleExportMode === 'append' && !selectedGoogleDocId)}
+                className="inline-flex items-center gap-2 px-3.5 py-2 bg-[#4da3ff] text-[#0b0b0f] border border-[#4da3ff]/80 rounded-xl text-xs font-medium hover:bg-[#4da3ff]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {googleExportStatus === 'creating-doc' || googleExportStatus === 'writing-doc' ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <FileUp className="w-3.5 h-3.5" />
+                )}
+                {googleExportStatus === 'creating-doc'
+                  ? 'Creating Doc...'
+                  : googleExportStatus === 'writing-doc'
+                  ? googleExportMode === 'append' ? 'Adding Entry...' : 'Writing Notes...'
+                  : googleExportMode === 'create' ? 'Create Google Doc' : 'Add to Doc'}
+              </button>
+
+              {googleConnected ? (
+                <button
+                  onClick={handleGoogleDisconnect}
+                  disabled={googleIsBusy}
+                  className="inline-flex items-center gap-2 px-3.5 py-2 bg-white/[0.02] text-[#9aa0aa] border border-white/10 rounded-xl text-xs font-medium hover:bg-white/[0.06] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  Disconnect
+                </button>
+              ) : null}
+            </div>
+
+            {!hasExportableText ? (
+              <p className="text-[#7f8692] text-[11px]">
+                Extract text from an image, then use Add to existing to append to your selected Google Doc.
+              </p>
+            ) : null}
+          </div>
 
           {/* Action Button */}
           {status === 'ready' && (
