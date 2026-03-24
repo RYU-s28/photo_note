@@ -935,9 +935,13 @@ export default function App() {
 
       setSelectedGoogleDocId(nextSelectedDocId || null);
 
-      if (docs.length > 0) {
-        setGoogleExportMode(previousMode => (previousMode === 'create' ? 'create' : 'append'));
-      }
+      setGoogleExportMode(previousMode => {
+        if (docs.length === 0) {
+          return 'create';
+        }
+
+        return previousMode === 'create' ? 'create' : 'append';
+      });
     } finally {
       setGoogleDocsLoading(false);
     }
@@ -1068,12 +1072,21 @@ export default function App() {
       let accessToken = await ensureGoogleAccessToken();
 
       const executeExport = async (token: string) => {
-        if (googleExportMode === 'append' && selectedGoogleDocId) {
+        const appendDocId =
+          googleExportMode === 'append'
+            ? selectedGoogleDocId || (googleDocs.length > 0 ? googleDocs[0].id : null)
+            : null;
+
+        if (googleExportMode === 'append' && appendDocId) {
           // Append to existing doc
           setGoogleExportStatus('writing-doc');
-          const selectedDoc = googleDocs.find((d) => d.id === selectedGoogleDocId);
-          await appendTextToGoogleDoc(token, selectedGoogleDocId, normalizedText);
-          const docUrl = selectedDoc?.webViewLink || `https://docs.google.com/document/d/${selectedGoogleDocId}/edit`;
+          if (appendDocId !== selectedGoogleDocId) {
+            setSelectedGoogleDocId(appendDocId);
+          }
+
+          const selectedDoc = googleDocs.find((d) => d.id === appendDocId);
+          await appendTextToGoogleDoc(token, appendDocId, normalizedText);
+          const docUrl = selectedDoc?.webViewLink || `https://docs.google.com/document/d/${appendDocId}/edit`;
           setGoogleDocTitle(selectedDoc?.name || 'Note Document');
           setGoogleDocUrl(docUrl);
         } else {
@@ -2003,7 +2016,7 @@ export default function App() {
 
               <button
                 onClick={handleExportToGoogleDocs}
-                disabled={googleAuthStatus !== 'ready' || googleIsBusy || !hasExportableText || (googleExportMode === 'append' && !selectedGoogleDocId)}
+                disabled={googleAuthStatus !== 'ready' || googleIsBusy || !hasExportableText || (googleExportMode === 'append' && googleDocsLoading)}
                 className="inline-flex items-center gap-2 px-3.5 py-2 bg-[#4da3ff] text-[#0b0b0f] border border-[#4da3ff]/80 rounded-xl text-xs font-medium hover:bg-[#4da3ff]/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 {googleExportStatus === 'creating-doc' || googleExportStatus === 'writing-doc' ? (
