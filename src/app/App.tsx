@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import {
   Upload,
   FileText,
+  History,
   Check,
   Copy,
   Loader2,
@@ -15,6 +16,8 @@ import {
   FileUp,
   ExternalLink,
   ChevronDown,
+  Crop,
+  Trash2,
 } from 'lucide-react';
 import Tesseract from 'tesseract.js';
 
@@ -87,6 +90,34 @@ type GoogleDriveFileCreateResponse = {
   webViewLink?: string;
 };
 
+type GoogleUserProfileResponse = {
+  sub?: string;
+  email?: string;
+  name?: string;
+  picture?: string;
+};
+
+type GoogleUserProfile = {
+  id: string;
+  email: string;
+  name: string;
+};
+
+type HistoryAction = 'extract' | 'extract-and-append' | 'export-create' | 'export-append';
+
+type ExportHistoryEntry = {
+  id: string;
+  createdAt: string;
+  action: HistoryAction;
+  imageCount: number;
+  textPreview: string;
+  ocrModel: OcrModelPreference | OcrEngine;
+  targetDocId?: string;
+  targetDocName?: string;
+  ok: boolean;
+  error?: string;
+};
+
 type GoogleApiErrorResponse = {
   error?: {
     message?: string;
@@ -99,6 +130,19 @@ type AppEnv = {
   VITE_GOOGLE_DRIVE_FOLDER_ID?: string;
 };
 
+type SelectedImageItem = {
+  id: string;
+  name: string;
+  src: string;
+};
+
+type CropRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 const MIN_CAMERA_ZOOM = 1;
 const MAX_CAMERA_ZOOM = 3;
 const appEnv = (import.meta as { env?: AppEnv }).env || {};
@@ -108,6 +152,9 @@ const GOOGLE_DRIVE_FOLDER_ID = (appEnv.VITE_GOOGLE_DRIVE_FOLDER_ID || '').trim()
 const GOOGLE_CLIENT_ID_SETUP_HINT =
   'Set VITE_GOOGLE_CLIENT_ID in your build environment. For GitHub Pages, add it in Settings > Secrets and variables > Actions, then redeploy.';
 const GOOGLE_OAUTH_SCOPES = [
+  'openid',
+  'email',
+  'profile',
   'https://www.googleapis.com/auth/drive.file',
   'https://www.googleapis.com/auth/drive.metadata.readonly',
   'https://www.googleapis.com/auth/documents',
@@ -116,6 +163,14 @@ const GOOGLE_IDENTITY_SCRIPT_SRC = 'https://accounts.google.com/gsi/client';
 const GOOGLE_SELECTED_DOC_ID_STORAGE_KEY = 'photo-note.google.selected-doc-id';
 const GOOGLE_EXPORT_MODE_STORAGE_KEY = 'photo-note.google.export-mode';
 const GOOGLE_NEW_DOC_NAME_STORAGE_KEY = 'photo-note.google.new-doc-name';
+const GOOGLE_HISTORY_STORAGE_KEY_PREFIX = 'photo-note.google.history';
+const MAX_HISTORY_ENTRIES = 80;
+const DEFAULT_CROP_RECT: CropRect = {
+  x: 10,
+  y: 10,
+  width: 80,
+  height: 80,
+};
 
 const getStoredGoogleExportMode = (): 'create' | 'append' => {
   if (typeof window === 'undefined') {
@@ -142,6 +197,9 @@ const getStoredGoogleNewDocName = () => {
 
   return window.localStorage.getItem(GOOGLE_NEW_DOC_NAME_STORAGE_KEY) || '';
 };
+
+const getGoogleHistoryStorageKey = (googleUserId: string) =>
+  `${GOOGLE_HISTORY_STORAGE_KEY_PREFIX}.${googleUserId}`;
 
 const OCR_MODEL_OPTIONS: Array<{
   id: OcrModelPreference;
@@ -170,7 +228,8 @@ const OCR_MODEL_OPTIONS: Array<{
   },
 ];
 
-const clampZoom = (zoomValue: number) => Math.min(MAX_CAMERA_ZOOM, Math.max(MIN_CAMERA_ZOOM, zoomValue));
+const clampZoom = (zoomValue: number, minZoom = MIN_CAMERA_ZOOM, maxZoom = MAX_CAMERA_ZOOM) =>
+  Math.min(maxZoom, Math.max(minZoom, zoomValue));
 const getApiUrl = (path: string) => `${API_BASE_URL}${path}`;
 
 const getOcrModelLabel = (model: OcrModelPreference | OcrEngine) => {
@@ -292,6 +351,113 @@ const normalizeExtractedText = (text: string) => {
     .trim();
 };
 
+const isListLine = (line: string) => /^\s*(?:[-*•]|\d{1,3}[.)])\s+/.test(line);
+const isHeadingLine = (line: string) => /^[A-Z0-9][A-Z0-9\s:&/\-]{3,}$/.test(line.trim());
+const endsSentence = (line: string) => /[.!?;:]["')\]]?$/.test(line.trim());
+const startsLowercaseWord = (line: string) => /^[a-z]/.test(line.trim());
+
+const cleanExtractedText = (rawText: string, aggressive = false) => {
+  const normalized = normalizeExtractedText(rawText);
+  if (!normalized) {
+    return '';
+  }
+
+  const rawLines = normalized.split('\n');
+  const compactedLines = rawLines.map(line => {
+    // Keep spacing for table-like lines where spacing likely encodes columns.
+    const isTableLike = /\S\s{3,}\S/.test(line);
+    if (isTableLike) {
+      return line.trimEnd();
+    }
+
+    return line.replace(/\s+/g, ' ').trim();
+  });
+
+  const rebuilt: string[] = [];
+  for (const line of compactedLines) {
+    if (!line) {
+      if (rebuilt.length > 0 && rebuilt[rebuilt.length - 1] !== '') {
+        rebuilt.push('');
+      }
+      continue;
+    }
+
+    if (rebuilt.length === 0 || rebuilt[rebuilt.length - 1] === '') {
+      rebuilt.push(line);
+      continue;
+    }
+
+    const previous = rebuilt[rebuilt.length - 1];
+    const shouldKeepSeparate =
+      isListLine(line) ||
+      isListLine(previous) ||
+      isHeadingLine(line) ||
+      isHeadingLine(previous) ||
+      (!aggressive && endsSentence(previous));
+
+    if (shouldKeepSeparate) {
+      rebuilt.push(line);
+      continue;
+    }
+
+    if (/-$/.test(previous)) {
+      rebuilt[rebuilt.length - 1] = `${previous.slice(0, -1)}${line}`;
+      continue;
+    }
+
+    if (startsLowercaseWord(line) || previous.length < (aggressive ? 80 : 45)) {
+      rebuilt[rebuilt.length - 1] = `${previous} ${line}`;
+    } else {
+      rebuilt.push(line);
+    }
+  }
+
+  let cleaned = rebuilt
+    .join('\n')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .replace(/([([{])\s+/g, '$1')
+    .replace(/\s+([)\]}])/g, '$1')
+    .replace(/(\w)\s+'\s+(\w)/g, "$1'$2")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  if (aggressive) {
+    const wordFixes: Array<[RegExp, string]> = [
+      [/\bteh\b/gi, 'the'],
+      [/\badn\b/gi, 'and'],
+      [/\brecieve\b/gi, 'receive'],
+      [/\bseperate\b/gi, 'separate'],
+      [/\bimformation\b/gi, 'information'],
+      [/\bmodem\b/g, 'modern'],
+      [/\b0f\b/g, 'of'],
+      [/\bln\b/g, 'In'],
+      [/\bthis\sis\sa\stest\sof\b/gi, 'this is a test of'],
+      [/\brn\b/g, 'm'],
+      [/\bI\s{0,1}\|\b/g, 'I'],
+    ];
+
+    for (const [pattern, replacement] of wordFixes) {
+      cleaned = cleaned.replace(pattern, replacement);
+    }
+
+    // Improve sentence casing without forcing all-caps headings.
+    cleaned = cleaned
+      .split('\n')
+      .map(line => {
+        if (!line || isHeadingLine(line) || isListLine(line)) {
+          return line;
+        }
+
+        return line.replace(/(^|[.!?]\s+)([a-z])/g, (_match, prefix: string, letter: string) => {
+          return `${prefix}${letter.toUpperCase()}`;
+        });
+      })
+      .join('\n');
+  }
+
+  return cleaned;
+};
+
 const buildGoogleDocTitle = () => {
   const now = new Date();
   const date = now.toLocaleDateString();
@@ -392,6 +558,8 @@ export default function App() {
   const [ocrEngine, setOcrEngine] = useState<OcrEngine | null>(null);
   const [ocrModelPreference, setOcrModelPreference] = useState<OcrModelPreference>('auto');
   const [isModelSelectorOpen, setIsModelSelectorOpen] = useState(false);
+  const [autoCleanExtractedText, setAutoCleanExtractedText] = useState(true);
+  const [aggressiveCleanEnabled, setAggressiveCleanEnabled] = useState(false);
   const [ocrFallbackReason, setOcrFallbackReason] = useState('');
   const [ocrSourceInfo, setOcrSourceInfo] = useState('');
   const [copied, setCopied] = useState(false);
@@ -409,7 +577,14 @@ export default function App() {
   const [cameraError, setCameraError] = useState('');
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
   const [cameraZoom, setCameraZoom] = useState<number>(1);
+  const [cameraMinZoom, setCameraMinZoom] = useState<number>(MIN_CAMERA_ZOOM);
+  const [cameraMaxZoom, setCameraMaxZoom] = useState<number>(MAX_CAMERA_ZOOM);
+  const [cameraUsesOpticalZoom, setCameraUsesOpticalZoom] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const [selectedImages, setSelectedImages] = useState<SelectedImageItem[]>([]);
+  const [activeImageIndex, setActiveImageIndex] = useState(0);
+  const [cropEnabled, setCropEnabled] = useState(false);
+  const [cropRect, setCropRect] = useState<CropRect>(DEFAULT_CROP_RECT);
   const [googleAuthStatus, setGoogleAuthStatus] = useState<GoogleAuthStatus>(
     GOOGLE_CLIENT_ID ? 'loading' : 'disabled'
   );
@@ -428,6 +603,8 @@ export default function App() {
   const [googleExportMode, setGoogleExportMode] = useState<'create' | 'append'>(
     getStoredGoogleExportMode
   );
+  const [googleUserProfile, setGoogleUserProfile] = useState<GoogleUserProfile | null>(null);
+  const [historyEntries, setHistoryEntries] = useState<ExportHistoryEntry[]>([]);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -435,6 +612,7 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const pinchStartDistanceRef = useRef<number | null>(null);
   const pinchStartZoomRef = useRef<number>(1);
+  const historyHydratingRef = useRef(false);
 
   const resetGoogleExportFeedback = () => {
     setGoogleExportStatus('idle');
@@ -443,14 +621,222 @@ export default function App() {
     setGoogleDocTitle('');
   };
 
+  const resolveGoogleUserId = (profile: GoogleUserProfileResponse) => {
+    const sub = typeof profile.sub === 'string' ? profile.sub.trim() : '';
+    const email = typeof profile.email === 'string' ? profile.email.trim().toLowerCase() : '';
+    return sub || email;
+  };
+
+  const fetchGoogleUserProfile = async (accessToken: string) => {
+    const response = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(await toGoogleApiErrorMessage(response, 'Failed to read Google profile'));
+    }
+
+    const payload = (await response.json()) as GoogleUserProfileResponse;
+    const userId = resolveGoogleUserId(payload);
+    if (!userId) {
+      throw new Error('Google profile did not include a stable account ID.');
+    }
+
+    return {
+      id: userId,
+      email: payload.email?.trim() || '',
+      name: payload.name?.trim() || payload.email?.trim() || 'Google User',
+    } satisfies GoogleUserProfile;
+  };
+
+  const pushHistoryEntry = (entry: Omit<ExportHistoryEntry, 'id' | 'createdAt'>) => {
+    if (!googleUserProfile) {
+      return;
+    }
+
+    setHistoryEntries(previous => [
+      {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        createdAt: new Date().toISOString(),
+        ...entry,
+      },
+      ...previous,
+    ].slice(0, MAX_HISTORY_ENTRIES));
+  };
+
+  const toEditorText = (text: string) => {
+    return autoCleanExtractedText
+      ? cleanExtractedText(text, aggressiveCleanEnabled)
+      : normalizeExtractedText(text);
+  };
+
+  const fetchHistoryFromServer = async (accessToken: string) => {
+    const response = await fetch(getApiUrl('/api/history/google'), {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(await toGoogleApiErrorMessage(response, 'Failed to load history'));
+    }
+
+    const payload = (await response.json()) as { entries?: ExportHistoryEntry[] };
+    return Array.isArray(payload.entries)
+      ? payload.entries.slice(0, MAX_HISTORY_ENTRIES)
+      : [];
+  };
+
+  const saveHistoryToServer = async (accessToken: string, entries: ExportHistoryEntry[]) => {
+    const response = await fetch(getApiUrl('/api/history/google'), {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        entries: entries.slice(0, MAX_HISTORY_ENTRIES),
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(await toGoogleApiErrorMessage(response, 'Failed to sync history'));
+    }
+  };
+
+  const applyTrackZoom = async (stream: MediaStream, zoomLevel: number) => {
+    const [videoTrack] = stream.getVideoTracks();
+    if (!videoTrack || typeof videoTrack.applyConstraints !== 'function') {
+      return false;
+    }
+
+    try {
+      const zoomConstraint = { zoom: zoomLevel } as unknown as MediaTrackConstraintSet;
+      await videoTrack.applyConstraints({
+        advanced: [zoomConstraint],
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const readFilesAsImages = async (files: File[]) => {
+    const imageFiles = files.filter(file => file.type.startsWith('image/'));
+    const images = await Promise.all(
+      imageFiles.map(
+        file =>
+          new Promise<SelectedImageItem>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = event => {
+              const result = event.target?.result;
+              if (typeof result !== 'string') {
+                reject(new Error('Failed to read image file.'));
+                return;
+              }
+
+              resolve({
+                id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+                name: file.name,
+                src: result,
+              });
+            };
+            reader.onerror = () => reject(new Error('Failed to read image file.'));
+            reader.readAsDataURL(file);
+          })
+      )
+    );
+
+    return images;
+  };
+
+  const setActiveImages = (images: SelectedImageItem[]) => {
+    if (images.length === 0) {
+      return;
+    }
+
+    setSelectedImages(images);
+    setActiveImageIndex(0);
+    setImageSrc(images[0].src);
+    setStatus('ready');
+    setExtractedText('');
+    setOcrEngine(null);
+    setOcrFallbackReason('');
+    setOcrSourceInfo('');
+    setOcrProgress(0);
+    setCopied(false);
+    resetGoogleExportFeedback();
+  };
+
+  const cropImageIfEnabled = async (sourceImage: string) => {
+    if (!cropEnabled || !canvasRef.current) {
+      return sourceImage;
+    }
+
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('Failed to prepare image crop.'));
+      image.src = sourceImage;
+    });
+
+    const canvas = canvasRef.current;
+    const cropX = Math.max(0, Math.min(100, cropRect.x));
+    const cropY = Math.max(0, Math.min(100, cropRect.y));
+    const cropWidth = Math.max(10, Math.min(100 - cropX, cropRect.width));
+    const cropHeight = Math.max(10, Math.min(100 - cropY, cropRect.height));
+
+    const sourceX = Math.round((cropX / 100) * img.width);
+    const sourceY = Math.round((cropY / 100) * img.height);
+    const sourceWidth = Math.round((cropWidth / 100) * img.width);
+    const sourceHeight = Math.round((cropHeight / 100) * img.height);
+
+    canvas.width = Math.max(1, sourceWidth);
+    canvas.height = Math.max(1, sourceHeight);
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return sourceImage;
+    }
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', 0.92);
+  };
+
   const startCamera = async (mode: 'environment' | 'user') => {
     stopCamera();
     setCameraZoom(1);
+    setCameraMinZoom(MIN_CAMERA_ZOOM);
+    setCameraMaxZoom(MAX_CAMERA_ZOOM);
+    setCameraUsesOpticalZoom(false);
     setCameraPreviewReady(false);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: mode }
       });
+
+      const [videoTrack] = stream.getVideoTracks();
+      const capabilities =
+        videoTrack && typeof videoTrack.getCapabilities === 'function'
+          ? (videoTrack.getCapabilities() as { zoom?: { min?: number; max?: number; step?: number } })
+          : {};
+
+      if (capabilities.zoom) {
+        const minZoom = Math.max(MIN_CAMERA_ZOOM, capabilities.zoom.min || MIN_CAMERA_ZOOM);
+        const maxZoom = Math.max(minZoom, capabilities.zoom.max || minZoom);
+        setCameraMinZoom(minZoom);
+        setCameraMaxZoom(maxZoom);
+
+        const applied = await applyTrackZoom(stream, minZoom);
+        setCameraUsesOpticalZoom(applied);
+        setCameraZoom(minZoom);
+      }
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play().catch(() => {
@@ -513,7 +899,7 @@ export default function App() {
     e.preventDefault();
     const currentDistance = getTouchDistance(e.touches);
     const zoomMultiplier = currentDistance / pinchStartDistanceRef.current;
-    const nextZoom = clampZoom(pinchStartZoomRef.current * zoomMultiplier);
+    const nextZoom = clampZoom(pinchStartZoomRef.current * zoomMultiplier, cameraMinZoom, cameraMaxZoom);
     setCameraZoom(nextZoom);
   };
 
@@ -523,6 +909,16 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    if (!streamRef.current || !cameraUsesOpticalZoom) {
+      return;
+    }
+
+    applyTrackZoom(streamRef.current, cameraZoom).catch(() => {
+      // Ignore per-frame zoom apply errors and keep current preview alive.
+    });
+  }, [cameraZoom, cameraUsesOpticalZoom]);
+
   const capturePhoto = () => {
     if (videoRef.current && canvasRef.current) {
       const video = videoRef.current;
@@ -531,8 +927,8 @@ export default function App() {
       canvas.height = video.videoHeight;
       const ctx = canvas.getContext('2d');
       if (ctx) {
-        const sourceWidth = video.videoWidth / cameraZoom;
-        const sourceHeight = video.videoHeight / cameraZoom;
+        const sourceWidth = cameraUsesOpticalZoom ? video.videoWidth : video.videoWidth / cameraZoom;
+        const sourceHeight = cameraUsesOpticalZoom ? video.videoHeight : video.videoHeight / cameraZoom;
         const sourceX = (video.videoWidth - sourceWidth) / 2;
         const sourceY = (video.videoHeight - sourceHeight) / 2;
 
@@ -559,47 +955,33 @@ export default function App() {
         ctx.restore();
 
         const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
-        setImageSrc(dataUrl);
-        setStatus('ready');
-        resetGoogleExportFeedback();
+        setActiveImages([
+          {
+            id: `${Date.now()}-camera`,
+            name: `capture-${new Date().toISOString()}.jpg`,
+            src: dataUrl,
+          },
+        ]);
       }
-    }
-  };
-
-  const setSelectedImage = (file: File) => {
-    if (!file.type.startsWith('image/')) {
-      return;
-    }
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const result = event.target?.result;
-      if (typeof result !== 'string') {
-        return;
-      }
-
-      setImageSrc(result);
-      setStatus('ready');
-      setExtractedText('');
-      setOcrEngine(null);
-      setOcrFallbackReason('');
-      setOcrSourceInfo('');
-      setOcrProgress(0);
-      setCopied(false);
-      resetGoogleExportFeedback();
-    };
-    reader.readAsDataURL(file);
-
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
     }
   };
 
   // Handle manual file selection
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      setSelectedImage(file);
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) {
+      return;
+    }
+
+    try {
+      const images = await readFilesAsImages(files);
+      setActiveImages(images);
+    } catch (error) {
+      console.error('File selection error:', error);
+    }
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
     }
   };
 
@@ -616,13 +998,21 @@ export default function App() {
     setIsDragging(false);
   };
 
-  const handleDrop = (e: React.DragEvent) => {
+  const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setIsDragging(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) {
-      setSelectedImage(file);
+
+    const files = Array.from(e.dataTransfer.files || []);
+    if (files.length === 0) {
+      return;
+    }
+
+    try {
+      const images = await readFilesAsImages(files);
+      setActiveImages(images);
+    } catch (error) {
+      console.error('Drop upload error:', error);
     }
   };
 
@@ -649,8 +1039,13 @@ export default function App() {
         }
 
         event.preventDefault();
-        setSelectedImage(pastedImage);
-        break;
+        readFilesAsImages([pastedImage])
+          .then(images => {
+            setActiveImages(images);
+          })
+          .catch(error => {
+            console.error('Paste image error:', error);
+          });
       }
     };
 
@@ -784,6 +1179,14 @@ export default function App() {
     setGoogleAccessToken(tokenResponse.access_token);
     setGoogleAccessTokenExpiresAt(Date.now() + expiresInSeconds * 1000);
     setGoogleAuthStatus('ready');
+
+    try {
+      const profile = await fetchGoogleUserProfile(tokenResponse.access_token);
+      setGoogleUserProfile(profile);
+    } catch (profileError) {
+      console.warn('Could not fetch Google profile:', profileError);
+      setGoogleUserProfile(null);
+    }
 
     return tokenResponse.access_token;
   };
@@ -947,9 +1350,15 @@ export default function App() {
     }
   };
 
-  const appendTextToGoogleDoc = async (accessToken: string, documentId: string, rawText: string) => {
+  const appendTextToGoogleDoc = async (
+    accessToken: string,
+    documentId: string,
+    rawText: string,
+    sourceLabel?: string
+  ) => {
     const timestamp = new Date().toLocaleString();
-    const entryText = `\n\n--- Note Entry (${timestamp}) ---\n${normalizeExtractedText(rawText) || 'No text was extracted.'}\n`;
+    const labelSuffix = sourceLabel ? ` - ${sourceLabel}` : '';
+    const entryText = `\n\n--- Note Entry (${timestamp}${labelSuffix}) ---\n${normalizeExtractedText(rawText) || 'No text was extracted.'}\n`;
 
     const response = await fetch(`https://docs.googleapis.com/v1/documents/${documentId}:batchUpdate`, {
       method: 'POST',
@@ -1011,7 +1420,9 @@ export default function App() {
 
     setGoogleAccessToken(null);
     setGoogleAccessTokenExpiresAt(0);
+    setGoogleUserProfile(null);
     setGoogleDocs([]);
+    setHistoryEntries([]);
     setSelectedGoogleDocId(getStoredSelectedGoogleDocId());
     resetGoogleExportFeedback();
   };
@@ -1049,6 +1460,89 @@ export default function App() {
 
     window.localStorage.removeItem(GOOGLE_NEW_DOC_NAME_STORAGE_KEY);
   }, [googleNewDocName]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    if (!googleUserProfile?.id) {
+      setHistoryEntries([]);
+      return;
+    }
+
+    let isCancelled = false;
+
+    const loadHistory = async () => {
+      const storageKey = getGoogleHistoryStorageKey(googleUserProfile.id);
+      const localRaw = window.localStorage.getItem(storageKey);
+
+      if (localRaw) {
+        try {
+          const localEntries = JSON.parse(localRaw) as ExportHistoryEntry[];
+          if (Array.isArray(localEntries) && !isCancelled) {
+            historyHydratingRef.current = true;
+            setHistoryEntries(localEntries.slice(0, MAX_HISTORY_ENTRIES));
+          }
+        } catch {
+          // Ignore malformed local history.
+        }
+      }
+
+      if (!googleAccessToken) {
+        return;
+      }
+
+      try {
+        const remoteEntries = await fetchHistoryFromServer(googleAccessToken);
+        if (isCancelled) {
+          return;
+        }
+
+        historyHydratingRef.current = true;
+        setHistoryEntries(remoteEntries);
+        window.localStorage.setItem(storageKey, JSON.stringify(remoteEntries));
+      } catch (error) {
+        console.warn('History sync load warning:', error);
+      }
+    };
+
+    loadHistory();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [googleUserProfile?.id, googleAccessToken]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !googleUserProfile?.id) {
+      return;
+    }
+
+    window.localStorage.setItem(
+      getGoogleHistoryStorageKey(googleUserProfile.id),
+      JSON.stringify(historyEntries.slice(0, MAX_HISTORY_ENTRIES))
+    );
+  }, [googleUserProfile?.id, historyEntries]);
+
+  useEffect(() => {
+    if (!googleUserProfile?.id || !googleAccessToken) {
+      return;
+    }
+
+    if (historyHydratingRef.current) {
+      historyHydratingRef.current = false;
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      saveHistoryToServer(googleAccessToken, historyEntries).catch(error => {
+        console.warn('History sync save warning:', error);
+      });
+    }, 350);
+
+    return () => window.clearTimeout(timer);
+  }, [googleUserProfile?.id, googleAccessToken, historyEntries]);
 
   const handleExportToGoogleDocs = async () => {
     const normalizedText = normalizeExtractedText(extractedText);
@@ -1089,6 +1583,12 @@ export default function App() {
           const docUrl = selectedDoc?.webViewLink || `https://docs.google.com/document/d/${appendDocId}/edit`;
           setGoogleDocTitle(selectedDoc?.name || 'Note Document');
           setGoogleDocUrl(docUrl);
+
+          return {
+            action: 'export-append' as const,
+            targetDocId: appendDocId,
+            targetDocName: selectedDoc?.name || 'Note Document',
+          };
         } else {
           // Create new doc
           setGoogleExportStatus('creating-doc');
@@ -1109,11 +1609,23 @@ export default function App() {
             setSelectedGoogleDocId(createdDoc.id);
             setGoogleExportMode('append');
           }
+
+          return {
+            action: 'export-create' as const,
+            targetDocId: createdDoc.id,
+            targetDocName: title,
+          };
         }
       };
 
+      let exportMeta: {
+        action: 'export-create' | 'export-append';
+        targetDocId?: string;
+        targetDocName?: string;
+      } | null = null;
+
       try {
-        await executeExport(accessToken);
+        exportMeta = await executeExport(accessToken);
       } catch (error) {
         const message = error instanceof Error ? error.message.toLowerCase() : '';
         const unauthorized = message.includes('http 401');
@@ -1123,12 +1635,32 @@ export default function App() {
         }
 
         accessToken = await requestGoogleAccessToken('consent');
-        await executeExport(accessToken);
+        exportMeta = await executeExport(accessToken);
+      }
+
+      if (exportMeta) {
+        pushHistoryEntry({
+          action: exportMeta.action,
+          imageCount: selectedImages.length || 1,
+          textPreview: normalizedText.slice(0, 220),
+          ocrModel: ocrEngine || ocrModelPreference,
+          targetDocId: exportMeta.targetDocId,
+          targetDocName: exportMeta.targetDocName,
+          ok: true,
+        });
       }
 
       setGoogleExportStatus('done');
     } catch (error) {
       console.error('Google Docs export error:', error);
+      pushHistoryEntry({
+        action: googleExportMode === 'append' ? 'export-append' : 'export-create',
+        imageCount: selectedImages.length || 1,
+        textPreview: normalizedText.slice(0, 220),
+        ocrModel: ocrEngine || ocrModelPreference,
+        ok: false,
+        error: error instanceof Error ? error.message : 'Export failed',
+      });
       setGoogleExportStatus('error');
       setGoogleExportError(
         error instanceof Error
@@ -1226,10 +1758,172 @@ export default function App() {
     );
   };
 
+  const extractFromImage = async (sourceImage: string) => {
+    const completeRemoteExtract = (
+      model: 'azure-vision' | 'azure-document-intelligence',
+      payload: AzureBackendOcrResponse
+    ) => {
+      setAzureBackendStatus('configured');
+      return {
+        text: payload.text || 'No text was found in the image.',
+        engine: model as OcrEngine,
+        sourceInfo: describeRemoteOcrSource(payload),
+        fallbackReason: '',
+      };
+    };
+
+    const runSelectedRemoteModel = async (model: 'azure-vision' | 'azure-document-intelligence') => {
+      const payload =
+        model === 'azure-document-intelligence'
+          ? await runAzureDocumentIntelligenceOCR(sourceImage)
+          : await runAzureVisionOCR(sourceImage);
+
+      return completeRemoteExtract(model, payload);
+    };
+
+    const syncRemoteStatusFromFailure = (
+      model: 'azure-vision' | 'azure-document-intelligence',
+      errorCode: string,
+      rawMessage: string
+    ) => {
+      const normalizedCode = errorCode.toLowerCase();
+
+      if (model === 'azure-vision' && errorCode === 'AZURE_NOT_CONFIGURED') {
+        setVisionBackendConfigured(false);
+        if (!documentIntelligenceBackendConfigured) {
+          setAzureBackendStatus('not-configured');
+        }
+      }
+
+      if (
+        model === 'azure-document-intelligence' &&
+        errorCode === 'DOCUMENT_INTELLIGENCE_NOT_CONFIGURED'
+      ) {
+        setDocumentIntelligenceBackendConfigured(false);
+        if (!visionBackendConfigured) {
+          setAzureBackendStatus('not-configured');
+        }
+      }
+
+      if (normalizedCode.includes('failed to fetch') || rawMessage.toLowerCase().includes('failed to fetch')) {
+        setAzureBackendStatus('unreachable');
+      }
+    };
+
+    const extractFailureReason = (
+      model: 'azure-vision' | 'azure-document-intelligence',
+      rawMessage: string
+    ) => {
+      const [errorCode, errorDetails] = rawMessage.split('::', 2);
+      const baseReason = toRemoteOcrFailureReason(model, errorCode || rawMessage);
+      return errorDetails ? `${baseReason} Details: ${errorDetails}` : baseReason;
+    };
+
+    if (ocrModelPreference === 'tesseract') {
+      setOcrStatusMsg('Running on-device OCR...');
+      const localText = await runTesseractOCR(sourceImage);
+      return {
+        text: localText,
+        engine: 'tesseract' as OcrEngine,
+        sourceInfo: '',
+        fallbackReason: '',
+      };
+    }
+
+    if (!navigator.onLine) {
+      if (ocrModelPreference === 'auto') {
+        setOcrStatusMsg('Offline mode: running on-device OCR...');
+        const localText = await runTesseractOCR(sourceImage);
+        return {
+          text: localText,
+          engine: 'tesseract' as OcrEngine,
+          sourceInfo: '',
+          fallbackReason: 'Device is offline.',
+        };
+      }
+
+      throw new Error(`${getOcrModelLabel(ocrModelPreference)} requires an internet connection.`);
+    }
+
+    if (
+      ocrModelPreference === 'azure-vision' ||
+      ocrModelPreference === 'azure-document-intelligence'
+    ) {
+      try {
+        return await runSelectedRemoteModel(ocrModelPreference);
+      } catch (remoteError: unknown) {
+        const rawMessage = remoteError instanceof Error ? remoteError.message : 'Unknown OCR error.';
+        const [errorCode] = rawMessage.split('::', 2);
+        syncRemoteStatusFromFailure(ocrModelPreference, errorCode || rawMessage, rawMessage);
+
+        return {
+          text: 'Could not extract text with the selected OCR model. Choose another model and try again.',
+          engine: null,
+          sourceInfo: '',
+          fallbackReason: extractFailureReason(ocrModelPreference, rawMessage),
+        };
+      }
+    }
+
+    const autoCloudModels: Array<'azure-vision' | 'azure-document-intelligence'> = [
+      'azure-vision',
+      'azure-document-intelligence',
+    ];
+    let fallbackReason = 'Cloud OCR models are unavailable.';
+
+    for (const model of autoCloudModels) {
+      try {
+        return await runSelectedRemoteModel(model);
+      } catch (remoteError: unknown) {
+        const rawMessage = remoteError instanceof Error ? remoteError.message : 'Unknown OCR error.';
+        const [errorCode] = rawMessage.split('::', 2);
+
+        syncRemoteStatusFromFailure(model, errorCode || rawMessage, rawMessage);
+        fallbackReason = extractFailureReason(model, rawMessage);
+        console.warn(`${getOcrModelLabel(model)} fallback:`, rawMessage);
+        setOcrProgress(0);
+      }
+    }
+
+    setOcrStatusMsg('Cloud OCR unavailable, switching to on-device OCR...');
+    const localText = await runTesseractOCR(sourceImage);
+    return {
+      text: localText,
+      engine: 'tesseract' as OcrEngine,
+      sourceInfo: '',
+      fallbackReason,
+    };
+  };
+
+  const resolveAppendTargetDocId = () => {
+    return selectedGoogleDocId || (googleDocs.length > 0 ? googleDocs[0].id : null);
+  };
+
+  const appendOcrToSelectedDoc = async (
+    token: string,
+    text: string,
+    sourceLabel?: string
+  ) => {
+    const appendDocId = resolveAppendTargetDocId();
+    if (!appendDocId) {
+      throw new Error('Select a Google Doc first, or create one before using one-click append.');
+    }
+
+    const selectedDoc = googleDocs.find(d => d.id === appendDocId);
+    await appendTextToGoogleDoc(token, appendDocId, text, sourceLabel);
+    const docUrl = selectedDoc?.webViewLink || `https://docs.google.com/document/d/${appendDocId}/edit`;
+    setGoogleDocTitle(selectedDoc?.name || 'Note Document');
+    setGoogleDocUrl(docUrl);
+    if (appendDocId !== selectedGoogleDocId) {
+      setSelectedGoogleDocId(appendDocId);
+    }
+  };
+
   const handleExtract = async () => {
-    if (!imageSrc) return;
-    const sourceImage = imageSrc;
-    
+    if (selectedImages.length === 0) {
+      return;
+    }
+
     setStatus('extracting');
     setOcrEngine(null);
     setOcrFallbackReason('');
@@ -1237,145 +1931,179 @@ export default function App() {
     setOcrStatusMsg('Preparing image...');
     setOcrProgress(0);
     resetGoogleExportFeedback();
-    
+
     try {
-      const completeRemoteExtract = (
-        model: 'azure-vision' | 'azure-document-intelligence',
-        payload: AzureBackendOcrResponse
-      ) => {
-        setExtractedText(payload.text || 'No text was found in the image.');
-        setOcrEngine(model);
-        setOcrSourceInfo(describeRemoteOcrSource(payload));
-        setOcrFallbackReason('');
-        setAzureBackendStatus('configured');
-        setStatus('done');
-      };
+      if (selectedImages.length === 1) {
+        const preppedImage = await cropImageIfEnabled(selectedImages[0].src);
+        const result = await extractFromImage(preppedImage);
 
-      const runSelectedRemoteModel = async (model: 'azure-vision' | 'azure-document-intelligence') => {
-        const payload =
-          model === 'azure-document-intelligence'
-            ? await runAzureDocumentIntelligenceOCR(sourceImage)
-            : await runAzureVisionOCR(sourceImage);
-
-        completeRemoteExtract(model, payload);
-      };
-
-      const syncRemoteStatusFromFailure = (
-        model: 'azure-vision' | 'azure-document-intelligence',
-        errorCode: string,
-        rawMessage: string
-      ) => {
-        const normalizedCode = errorCode.toLowerCase();
-
-        if (model === 'azure-vision' && errorCode === 'AZURE_NOT_CONFIGURED') {
-          setVisionBackendConfigured(false);
-          if (!documentIntelligenceBackendConfigured) {
-            setAzureBackendStatus('not-configured');
-          }
-        }
-
-        if (
-          model === 'azure-document-intelligence' &&
-          errorCode === 'DOCUMENT_INTELLIGENCE_NOT_CONFIGURED'
-        ) {
-          setDocumentIntelligenceBackendConfigured(false);
-          if (!visionBackendConfigured) {
-            setAzureBackendStatus('not-configured');
-          }
-        }
-
-        if (normalizedCode.includes('failed to fetch') || rawMessage.toLowerCase().includes('failed to fetch')) {
-          setAzureBackendStatus('unreachable');
-        }
-      };
-
-      const extractFailureReason = (
-        model: 'azure-vision' | 'azure-document-intelligence',
-        rawMessage: string
-      ) => {
-        const [errorCode, errorDetails] = rawMessage.split('::', 2);
-        const baseReason = toRemoteOcrFailureReason(model, errorCode || rawMessage);
-        return errorDetails ? `${baseReason} Details: ${errorDetails}` : baseReason;
-      };
-
-      if (ocrModelPreference === 'tesseract') {
-        setOcrStatusMsg('Running on-device OCR...');
-        const localText = await runTesseractOCR(sourceImage);
-        setExtractedText(localText);
-        setOcrEngine('tesseract');
+        setExtractedText(toEditorText(result.text));
+        setOcrEngine(result.engine);
+        setOcrSourceInfo(result.sourceInfo);
+        setOcrFallbackReason(result.fallbackReason);
+        pushHistoryEntry({
+          action: 'extract',
+          imageCount: 1,
+          textPreview: normalizeExtractedText(result.text).slice(0, 220),
+          ocrModel: result.engine || ocrModelPreference,
+          ok: true,
+        });
         setStatus('done');
         return;
       }
 
-      if (!navigator.onLine) {
-        if (ocrModelPreference === 'auto') {
-          setOcrFallbackReason('Device is offline.');
-          setOcrStatusMsg('Offline mode: running on-device OCR...');
-          const localText = await runTesseractOCR(sourceImage);
-          setExtractedText(localText);
-          setOcrEngine('tesseract');
-          setStatus('done');
-          return;
-        }
+      const bulkResults: string[] = [];
+      let lastEngine: OcrEngine | null = null;
+      let lastSourceInfo = '';
+      let lastFallbackReason = '';
 
-        throw new Error(`${getOcrModelLabel(ocrModelPreference)} requires an internet connection.`);
+      for (let index = 0; index < selectedImages.length; index += 1) {
+        const imageItem = selectedImages[index];
+        setOcrStatusMsg(`Extracting ${index + 1}/${selectedImages.length}: ${imageItem.name}`);
+        const preppedImage = await cropImageIfEnabled(imageItem.src);
+        const result = await extractFromImage(preppedImage);
+
+        bulkResults.push(
+          `--- ${imageItem.name} ---\n${toEditorText(result.text) || 'No text was extracted.'}`
+        );
+        lastEngine = result.engine;
+        lastSourceInfo = result.sourceInfo;
+        lastFallbackReason = result.fallbackReason;
       }
 
-      if (
-        ocrModelPreference === 'azure-vision' ||
-        ocrModelPreference === 'azure-document-intelligence'
-      ) {
-        try {
-          await runSelectedRemoteModel(ocrModelPreference);
-          return;
-        } catch (remoteError: unknown) {
-          const rawMessage = remoteError instanceof Error ? remoteError.message : 'Unknown OCR error.';
-          const [errorCode] = rawMessage.split('::', 2);
-          syncRemoteStatusFromFailure(ocrModelPreference, errorCode || rawMessage, rawMessage);
-
-          setExtractedText(
-            'Could not extract text with the selected OCR model. Choose another model and try again.'
-          );
-          setOcrEngine(null);
-          setOcrFallbackReason(extractFailureReason(ocrModelPreference, rawMessage));
-          setStatus('done');
-          return;
-        }
-      }
-
-      const autoCloudModels: Array<'azure-vision' | 'azure-document-intelligence'> = [
-        'azure-vision',
-        'azure-document-intelligence',
-      ];
-      let fallbackReason = 'Cloud OCR models are unavailable.';
-
-      for (const model of autoCloudModels) {
-        try {
-          await runSelectedRemoteModel(model);
-          return;
-        } catch (remoteError: unknown) {
-          const rawMessage = remoteError instanceof Error ? remoteError.message : 'Unknown OCR error.';
-          const [errorCode] = rawMessage.split('::', 2);
-
-          syncRemoteStatusFromFailure(model, errorCode || rawMessage, rawMessage);
-          fallbackReason = extractFailureReason(model, rawMessage);
-          console.warn(`${getOcrModelLabel(model)} fallback:`, rawMessage);
-          setOcrProgress(0);
-        }
-      }
-
-      setOcrFallbackReason(fallbackReason);
-      setOcrStatusMsg('Cloud OCR unavailable, switching to on-device OCR...');
-
-      const localText = await runTesseractOCR(sourceImage);
-      setExtractedText(localText);
-      setOcrEngine('tesseract');
+      setExtractedText(toEditorText(bulkResults.join('\n\n')));
+      setOcrEngine(lastEngine);
+      setOcrSourceInfo(lastSourceInfo);
+      setOcrFallbackReason(lastFallbackReason);
+      pushHistoryEntry({
+        action: 'extract',
+        imageCount: selectedImages.length,
+        textPreview: bulkResults.join('\n\n').slice(0, 220),
+        ocrModel: lastEngine || ocrModelPreference,
+        ok: true,
+      });
       setStatus('done');
     } catch (error) {
-      console.error("OCR Error:", error);
-      setExtractedText("Error extracting text. Please try again.");
+      console.error('OCR Error:', error);
+      pushHistoryEntry({
+        action: 'extract',
+        imageCount: selectedImages.length,
+        textPreview: '',
+        ocrModel: ocrModelPreference,
+        ok: false,
+        error: error instanceof Error ? error.message : 'OCR failed.',
+      });
+      setExtractedText('Error extracting text. Please try again.');
       setOcrEngine(null);
       setOcrFallbackReason(error instanceof Error ? error.message : 'OCR failed.');
+      setStatus('done');
+    }
+  };
+
+  const handleExtractAndAppend = async () => {
+    if (selectedImages.length === 0) {
+      return;
+    }
+
+    if (!GOOGLE_CLIENT_ID) {
+      setGoogleExportStatus('error');
+      setGoogleExportError(GOOGLE_CLIENT_ID_SETUP_HINT);
+      return;
+    }
+
+    setStatus('extracting');
+    setGoogleExportStatus('authorizing');
+    setGoogleExportError('');
+    setOcrEngine(null);
+    setOcrFallbackReason('');
+    setOcrSourceInfo('');
+    setOcrStatusMsg('Preparing image...');
+    setOcrProgress(0);
+
+    try {
+      let accessToken = await ensureGoogleAccessToken();
+
+      const tryAppend = async (token: string) => {
+        const collected: string[] = [];
+        let lastEngine: OcrEngine | null = null;
+        let lastSourceInfo = '';
+        let lastFallbackReason = '';
+
+        for (let index = 0; index < selectedImages.length; index += 1) {
+          const imageItem = selectedImages[index];
+          setOcrStatusMsg(`Extracting ${index + 1}/${selectedImages.length}: ${imageItem.name}`);
+          const preppedImage = await cropImageIfEnabled(imageItem.src);
+          const result = await extractFromImage(preppedImage);
+
+          setGoogleExportStatus('writing-doc');
+          await appendOcrToSelectedDoc(token, result.text, imageItem.name);
+
+          collected.push(
+            `--- ${imageItem.name} ---\n${toEditorText(result.text) || 'No text was extracted.'}`
+          );
+          lastEngine = result.engine;
+          lastSourceInfo = result.sourceInfo;
+          lastFallbackReason = result.fallbackReason;
+        }
+
+        setExtractedText(toEditorText(collected.join('\n\n')));
+        setOcrEngine(lastEngine);
+        setOcrSourceInfo(lastSourceInfo);
+        setOcrFallbackReason(lastFallbackReason);
+
+        return {
+          text: toEditorText(collected.join('\n\n')),
+          engine: lastEngine,
+        };
+      };
+
+      let appendResult: { text: string; engine: OcrEngine | null } | null = null;
+
+      try {
+        appendResult = await tryAppend(accessToken);
+      } catch (error) {
+        const message = error instanceof Error ? error.message.toLowerCase() : '';
+        const unauthorized = message.includes('http 401');
+        if (!unauthorized) {
+          throw error;
+        }
+
+        accessToken = await requestGoogleAccessToken('consent');
+        appendResult = await tryAppend(accessToken);
+      }
+
+      if (appendResult) {
+        const appendDocId = resolveAppendTargetDocId() || undefined;
+        const selectedDoc = appendDocId ? googleDocs.find(d => d.id === appendDocId) : undefined;
+        pushHistoryEntry({
+          action: 'extract-and-append',
+          imageCount: selectedImages.length,
+          textPreview: appendResult.text.slice(0, 220),
+          ocrModel: appendResult.engine || ocrModelPreference,
+          targetDocId: appendDocId,
+          targetDocName: selectedDoc?.name,
+          ok: true,
+        });
+      }
+
+      setGoogleExportStatus('done');
+      setStatus('done');
+    } catch (error) {
+      console.error('Extract and append error:', error);
+      pushHistoryEntry({
+        action: 'extract-and-append',
+        imageCount: selectedImages.length,
+        textPreview: '',
+        ocrModel: ocrModelPreference,
+        ok: false,
+        error: error instanceof Error ? error.message : 'Could not extract and append.',
+      });
+      setGoogleExportStatus('error');
+      setGoogleExportError(
+        error instanceof Error
+          ? error.message
+          : 'Could not extract and append to Google Docs. Please try again.'
+      );
       setStatus('done');
     }
   };
@@ -1386,15 +2114,27 @@ export default function App() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const handleCleanExtractedText = () => {
+    setExtractedText(previous => cleanExtractedText(previous, aggressiveCleanEnabled));
+  };
+
+  const handleClearHistory = () => {
+    setHistoryEntries([]);
+  };
+
   const handleReset = () => {
     setStatus('idle');
     setImageSrc(null);
+    setSelectedImages([]);
+    setActiveImageIndex(0);
     setExtractedText('');
     setOcrEngine(null);
     setOcrFallbackReason('');
     setOcrSourceInfo('');
     setOcrProgress(0);
     setCameraZoom(1);
+    setCropEnabled(false);
+    setCropRect(DEFAULT_CROP_RECT);
     resetGoogleExportFeedback();
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
@@ -1479,6 +2219,12 @@ export default function App() {
     Boolean(googleAccessToken) && googleAccessTokenExpiresAt > Date.now() + 10000;
 
   const hasExportableText = normalizeExtractedText(extractedText).length > 0;
+  const canExtractAndAppend =
+    googleConnected &&
+    !googleIsBusy &&
+    googleExportMode === 'append' &&
+    !googleDocsLoading &&
+    Boolean(resolveAppendTargetDocId());
 
   const googleStatusLabel =
     googleAuthStatus === 'disabled'
@@ -1509,6 +2255,25 @@ export default function App() {
   const googleConnectionPillClass = googleConnected
     ? 'border-emerald-400/30 text-emerald-300 bg-emerald-500/10'
     : 'border-white/15 text-[#9aa0aa] bg-white/[0.03]';
+
+  const googleAccountLabel =
+    googleUserProfile?.email || googleUserProfile?.name || 'Signed in Google account';
+
+  const getHistoryActionLabel = (action: HistoryAction) => {
+    if (action === 'extract') {
+      return 'Text extraction';
+    }
+
+    if (action === 'extract-and-append') {
+      return 'Extract + append';
+    }
+
+    if (action === 'export-create') {
+      return 'Create Google Doc';
+    }
+
+    return 'Append to Google Doc';
+  };
 
   return (
     <div className="min-h-screen bg-[#0b0b0f] text-[#f5f5f7] flex items-center justify-center p-4 sm:p-8 font-sans antialiased selection:bg-[#4da3ff]/30">
@@ -1651,6 +2416,7 @@ export default function App() {
                   type="file" 
                   className="hidden" 
                   accept="image/*" 
+                  multiple
                   ref={fileInputRef}
                   onChange={handleFileChange} 
                 />
@@ -1865,13 +2631,41 @@ export default function App() {
                 <div className="relative group">
                   <div className="absolute -inset-0.5 bg-gradient-to-b from-[#4da3ff]/10 to-transparent rounded-3xl opacity-0 group-hover:opacity-100 transition-opacity duration-500 blur-sm pointer-events-none" />
                   <div className="relative bg-[#1c1d23] border border-white/5 rounded-3xl p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]">
+                    <div className="absolute top-3 right-3 z-10 flex gap-2">
+                      <button
+                        onClick={() => setAutoCleanExtractedText(previous => !previous)}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] border transition-colors ${
+                          autoCleanExtractedText
+                            ? 'bg-[#4da3ff]/20 border-[#4da3ff]/40 text-[#8fc2ff]'
+                            : 'bg-white/[0.02] border-white/10 text-[#9aa0aa] hover:bg-white/[0.04]'
+                        }`}
+                      >
+                        Auto-clean {autoCleanExtractedText ? 'On' : 'Off'}
+                      </button>
+                      <button
+                        onClick={() => setAggressiveCleanEnabled(previous => !previous)}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] border transition-colors ${
+                          aggressiveCleanEnabled
+                            ? 'bg-amber-400/20 border-amber-300/40 text-amber-200'
+                            : 'bg-white/[0.02] border-white/10 text-[#9aa0aa] hover:bg-white/[0.04]'
+                        }`}
+                      >
+                        Aggressive {aggressiveCleanEnabled ? 'On' : 'Off'}
+                      </button>
+                    </div>
                     <textarea 
                       value={extractedText}
                       onChange={(e) => setExtractedText(e.target.value)}
                       placeholder="Start typing your note..."
-                      className="w-full h-64 bg-transparent p-5 text-[#f5f5f7] text-[15px] leading-relaxed focus:outline-none resize-none placeholder:text-[#9aa0aa]/50 custom-scrollbar"
+                      className="w-full h-64 bg-transparent p-5 pt-12 text-[#f5f5f7] text-[15px] leading-relaxed focus:outline-none resize-none placeholder:text-[#9aa0aa]/50 custom-scrollbar"
                     />
                     <div className="absolute bottom-4 right-4 flex gap-2">
+                      <button
+                        onClick={handleCleanExtractedText}
+                        className="flex items-center gap-2 px-4 py-2 bg-[#15161b] rounded-xl text-[#f5f5f7] hover:bg-white/[0.04] transition-all border border-white/5 shadow-sm font-medium text-xs"
+                      >
+                        Clean Text
+                      </button>
                       <button 
                         onClick={handleCopy}
                         className="flex items-center gap-2 px-4 py-2 bg-[#15161b] rounded-xl text-[#f5f5f7] hover:bg-white/[0.04] transition-all border border-white/5 shadow-sm font-medium text-xs"
@@ -2043,6 +2837,63 @@ export default function App() {
               ) : null}
             </div>
 
+            {googleConnected ? (
+              <div className="pt-2 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <History className="w-3.5 h-3.5 text-[#9aa0aa]" />
+                    <p className="text-[#9aa0aa] text-xs font-medium truncate">
+                      Transaction history for {googleAccountLabel}
+                    </p>
+                  </div>
+                  <button
+                    onClick={handleClearHistory}
+                    disabled={historyEntries.length === 0}
+                    className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] rounded-lg bg-white/[0.02] text-[#9aa0aa] border border-white/10 hover:bg-white/[0.06] disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    Clear
+                  </button>
+                </div>
+
+                {historyEntries.length === 0 ? (
+                  <p className="text-[#7f8692] text-[11px] bg-white/[0.02] border border-white/10 rounded-lg px-3 py-2">
+                    No transactions yet for this Google account.
+                  </p>
+                ) : (
+                  <div className="max-h-44 overflow-y-auto custom-scrollbar space-y-2 pr-1">
+                    {historyEntries.map((entry) => (
+                      <div key={entry.id} className="rounded-xl border border-white/8 bg-[#15161b] px-3 py-2.5">
+                        <div className="flex items-center justify-between gap-3">
+                          <p className="text-[#d8dbe1] text-xs font-medium truncate">
+                            {getHistoryActionLabel(entry.action)}
+                          </p>
+                          <span
+                            className={`text-[10px] px-1.5 py-0.5 rounded-full border ${
+                              entry.ok
+                                ? 'text-emerald-200 border-emerald-400/30 bg-emerald-500/10'
+                                : 'text-rose-200 border-rose-400/30 bg-rose-500/10'
+                            }`}
+                          >
+                            {entry.ok ? 'Success' : 'Failed'}
+                          </span>
+                        </div>
+                        <p className="text-[#7f8692] text-[11px] mt-1 truncate">
+                          {new Date(entry.createdAt).toLocaleString()} • {entry.imageCount} image{entry.imageCount > 1 ? 's' : ''}
+                          {entry.targetDocName ? ` • ${entry.targetDocName}` : ''}
+                        </p>
+                        <p className="text-[#9aa0aa] text-[11px] mt-1 line-clamp-2">
+                          {entry.ok
+                            ? entry.textPreview || 'No extracted preview.'
+                            : entry.error || 'Request failed.'}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : null}
+
             {!hasExportableText ? (
               <p className="text-[#7f8692] text-[11px]">
                 Extract text from an image, then use Add to existing to append to your selected Google Doc.
@@ -2052,14 +2903,26 @@ export default function App() {
 
           {/* Action Button */}
           {status === 'ready' && (
-            <motion.button 
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              onClick={handleExtract}
-              className="w-full bg-[#4da3ff] text-[#0b0b0f] py-4 rounded-2xl font-medium text-[15px] hover:bg-[#4da3ff]/90 active:scale-[0.98] transition-all shadow-[0_4px_14px_rgba(77,163,255,0.25)] flex items-center justify-center gap-2"
-            >
-              {ocrModelPreference === 'auto' ? 'Extract Text' : `Extract with ${selectedOcrModelLabel}`}
-            </motion.button>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <motion.button 
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                onClick={handleExtract}
+                className="w-full bg-[#4da3ff] text-[#0b0b0f] py-4 rounded-2xl font-medium text-[15px] hover:bg-[#4da3ff]/90 active:scale-[0.98] transition-all shadow-[0_4px_14px_rgba(77,163,255,0.25)] flex items-center justify-center gap-2"
+              >
+                {ocrModelPreference === 'auto' ? 'Extract Text' : `Extract with ${selectedOcrModelLabel}`}
+              </motion.button>
+
+              <motion.button
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                onClick={handleExtractAndAppend}
+                disabled={!canExtractAndAppend}
+                className="w-full bg-white/[0.04] text-[#f5f5f7] py-4 rounded-2xl font-medium text-[14px] border border-white/12 hover:bg-white/[0.07] disabled:opacity-50 disabled:cursor-not-allowed active:scale-[0.98] transition-all flex items-center justify-center gap-2"
+              >
+                Extract + Add to selected Doc
+              </motion.button>
+            </div>
           )}
 
         </div>

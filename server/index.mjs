@@ -15,6 +15,10 @@ const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_POLL_INTERVAL_MS = 1500;
 const DEFAULT_MAX_POLL_ATTEMPTS = 12;
+const GOOGLE_USER_INFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
+const HISTORY_STORE_DIR = path.join(workspaceRoot, '.data');
+const HISTORY_STORE_PATH = path.join(HISTORY_STORE_DIR, 'google-history.json');
+const MAX_HISTORY_ENTRIES = 200;
 
 const normalizeEndpoint = endpoint => endpoint.replace(/\/+$/, '');
 const normalizeOrigin = origin => origin.trim().replace(/\/+$/, '').toLowerCase();
@@ -49,6 +53,139 @@ const firstNonEmptyEnv = (...keys) => {
   }
 
   return '';
+};
+
+const ensureDirectory = dirPath => {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+};
+
+const readJsonFileSafe = filePath => {
+  try {
+    if (!fs.existsSync(filePath)) {
+      return null;
+    }
+
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!raw.trim()) {
+      return null;
+    }
+
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+};
+
+const writeJsonFileSafe = (filePath, value) => {
+  ensureDirectory(path.dirname(filePath));
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+};
+
+const readHistoryStore = () => {
+  const parsed = readJsonFileSafe(HISTORY_STORE_PATH);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {};
+  }
+
+  return parsed;
+};
+
+const writeHistoryStore = store => {
+  writeJsonFileSafe(HISTORY_STORE_PATH, store);
+};
+
+const toSafeString = (value, maxLength = 500) => {
+  if (typeof value !== 'string') {
+    return '';
+  }
+
+  return value.trim().slice(0, maxLength);
+};
+
+const toSafeNumber = (value, fallback = 0, min = 0, max = 10000) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return Math.max(min, Math.min(max, parsed));
+};
+
+const sanitizeHistoryAction = action => {
+  const allowed = new Set(['extract', 'extract-and-append', 'export-create', 'export-append']);
+  return allowed.has(action) ? action : 'extract';
+};
+
+const sanitizeHistoryEntry = rawEntry => {
+  const entry = rawEntry && typeof rawEntry === 'object' ? rawEntry : {};
+  const createdAt = toSafeString(entry.createdAt, 64) || new Date().toISOString();
+  return {
+    id: toSafeString(entry.id, 96) || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    createdAt,
+    action: sanitizeHistoryAction(toSafeString(entry.action, 64)),
+    imageCount: toSafeNumber(entry.imageCount, 1, 1, 999),
+    textPreview: toSafeString(entry.textPreview, 1200),
+    ocrModel: toSafeString(entry.ocrModel, 80) || 'auto',
+    targetDocId: toSafeString(entry.targetDocId, 128) || undefined,
+    targetDocName: toSafeString(entry.targetDocName, 240) || undefined,
+    ok: Boolean(entry.ok),
+    error: toSafeString(entry.error, 800) || undefined,
+  };
+};
+
+const sanitizeHistoryEntries = rawEntries => {
+  if (!Array.isArray(rawEntries)) {
+    return [];
+  }
+
+  return rawEntries
+    .slice(0, MAX_HISTORY_ENTRIES)
+    .map(sanitizeHistoryEntry)
+    .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)));
+};
+
+const getBearerToken = req => {
+  const authHeader = String(req.headers.authorization || '');
+  if (!authHeader.toLowerCase().startsWith('bearer ')) {
+    return '';
+  }
+
+  return authHeader.slice(7).trim();
+};
+
+const resolveGoogleUserFromAccessToken = async (accessToken, timeoutMs = 10000) => {
+  const response = await fetchWithTimeout(
+    GOOGLE_USER_INFO_URL,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    },
+    timeoutMs
+  );
+
+  if (!response.ok) {
+    const details = await readResponseBody(response);
+    throw new Error(`GOOGLE_AUTH_FAILED_${response.status}::${JSON.stringify(details || {})}`);
+  }
+
+  const payload = await response.json();
+  const sub = toSafeString(payload?.sub, 128);
+  const email = toSafeString(payload?.email, 320).toLowerCase();
+  const id = sub || email;
+
+  if (!id) {
+    throw new Error('GOOGLE_AUTH_MISSING_USER_ID');
+  }
+
+  return {
+    id,
+    email,
+    name: toSafeString(payload?.name, 320),
+  };
 };
 
 const loadDotEnv = dotenvPath => {
@@ -964,6 +1101,8 @@ const rawImageBodyParser = express.raw({
   limit: `${startupConfig.maxImageBytes}b`,
 });
 
+app.use(express.json({ limit: '1mb' }));
+
 app.use((req, res, next) => {
   const { allowedOrigins } = getConfig();
 
@@ -987,8 +1126,8 @@ app.use((req, res, next) => {
       res.append('Vary', 'Origin');
     }
 
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
     res.setHeader('Access-Control-Max-Age', '86400');
   }
 
@@ -1026,6 +1165,65 @@ app.get('/api/ocr/health', (_req, res) => {
     language: config.language,
     maxImageBytes: config.maxImageBytes,
   });
+});
+
+app.get('/api/history/google', async (req, res) => {
+  try {
+    const accessToken = getBearerToken(req);
+    if (!accessToken) {
+      res.status(401).json({
+        error: 'Missing Google access token.',
+        code: 'GOOGLE_AUTH_REQUIRED',
+      });
+      return;
+    }
+
+    const user = await resolveGoogleUserFromAccessToken(accessToken);
+    const store = readHistoryStore();
+    const entries = sanitizeHistoryEntries(store[user.id]);
+
+    res.json({
+      ok: true,
+      user,
+      entries,
+    });
+  } catch (error) {
+    console.error('[api] history load failed:', error);
+    res.status(401).json({
+      error: 'Failed to verify Google account.',
+      code: 'GOOGLE_AUTH_INVALID',
+    });
+  }
+});
+
+app.put('/api/history/google', async (req, res) => {
+  try {
+    const accessToken = getBearerToken(req);
+    if (!accessToken) {
+      res.status(401).json({
+        error: 'Missing Google access token.',
+        code: 'GOOGLE_AUTH_REQUIRED',
+      });
+      return;
+    }
+
+    const user = await resolveGoogleUserFromAccessToken(accessToken);
+    const entries = sanitizeHistoryEntries(req.body?.entries);
+    const store = readHistoryStore();
+    store[user.id] = entries;
+    writeHistoryStore(store);
+
+    res.json({
+      ok: true,
+      count: entries.length,
+    });
+  } catch (error) {
+    console.error('[api] history save failed:', error);
+    res.status(401).json({
+      error: 'Failed to verify Google account.',
+      code: 'GOOGLE_AUTH_INVALID',
+    });
+  }
 });
 
 app.post(
